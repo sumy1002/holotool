@@ -293,7 +293,14 @@ app\dist\HoloTool-1.0.1.zip.sha256
 「下載到暫存 → 解壓 → 關掉主程式 → 由 `.bat` 完成置換 → 重新啟動」，
 Python 這一端從頭到尾不去寫 `HoloTool.exe`。
 
-那支批次檔會先用 `tasklist` 等主程式的 PID 真的消失（最多 60 秒）才動手，
+那支批次檔會先用 `tasklist` 等主程式的 PID 真的消失才動手：客氣地等 15 秒，
+還在就 `taskkill` 強制關掉，再撐到 35 秒都關不掉就放棄並且**完全不動**安裝目錄。
+程式端也不是只呼叫 `destroy()` 就算了 —— 最後一定會走
+`updater.hard_exit()`（`os._exit`）確保行程真的結束。
+
+> 這兩層是同一個坑的正反面：只要「視窗關了但行程還活著」，.bat 就會一直等一個
+> 永遠不會消失的 PID，畫面就停在一個什麼都不做的黑視窗上。實際踩過。
+
 過程寫在 `app\logs\update.log`，更新出問題就先看這個檔。
 批次檔內容**一律只用 ASCII** —— cmd 預設不是 UTF-8，帶中文的批次檔在某些
 機器上會整行解析失敗，非常難查。
@@ -632,9 +639,14 @@ app\.venv\Scripts\python.exe app\tools\check_markers.py app\debug_captures    # 
 - **按「檢查更新」說 GitHub 擋住請求（HTTP 403）**：未登入的 API 查詢每小時有
   次數上限。等一小時，或直接到 Release 頁面手動下載。
 
+- **更新後停在一個黑色命令列視窗不動**：那是置換腳本卡在「等主程式關閉」。
+  視窗標題會是 `find "<某個數字>"`。**此時 `robocopy` 還沒跑，什麼都沒被改**，
+  直接關掉那個視窗，再到工作管理員確認沒有殘留的 `HoloTool.exe` 就好。
+  這個情形在 1.0.1 之後修掉了（程式端強制結束行程、腳本端等不到就 taskkill）。
+
 - **更新按完重開，版本還是舊的**：看 `app\logs\update.log`。
-  常見兩種：`pid ... still alive after 60s`（主程式沒有真的關掉 —— 通常是還有
-  另一個 HoloTool 視窗開著）、`robocopy exit code ...`（安裝目錄沒有寫入權限，
+  常見兩種：`pid ... would not exit`（主程式關不掉 —— 通常是還有另一個
+  HoloTool 視窗開著）、`robocopy exit code ...`（安裝目錄沒有寫入權限，
   例如裝在 `C:\Program Files` 底下）。兩種都不會動到你的校準與樣板，
   重跑一次或改用安裝檔手動更新即可。
 

@@ -326,6 +326,30 @@ class TestApplyScript(unittest.TestCase):
                 self.assertIn(os.path.join("app", folder), body, folder)
             self.assertIn("backups", body)
 
+    def test_force_kills_a_process_that_will_not_close(self):
+        """踩過的坑：GUI 的視窗關了、行程卻還活著，.bat 就一直等一個永遠不會
+        消失的 PID，畫面停在一個什麼都不做的黑視窗上。等不到就要強制結束。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            body = self._script(tmp)
+            self.assertIn("taskkill", body)
+            # 強制結束要排在複製之前，否則 exe 還鎖著自己
+            self.assertLess(body.index("taskkill"), body.index("robocopy"))
+            # 但也不能無限等下去
+            self.assertIn("aborting, nothing changed", body)
+
+    def test_gives_up_before_touching_anything(self):
+        """真的關不掉時，放棄的那條路徑必須完全不碰安裝目錄。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            lines = self._script(tmp).splitlines()
+            abort = next(i for i, line in enumerate(lines)
+                         if "aborting, nothing changed" in line)
+            copy = next(i for i, line in enumerate(lines)
+                        if line.strip().startswith("robocopy"))
+            # 放棄的分支在複製指令之前，而且是 goto finish（跳過複製）
+            self.assertLess(abort, copy)
+            self.assertTrue(any("goto finish" in line
+                                for line in lines[abort:copy]))
+
     def test_restarts_the_app(self):
         with tempfile.TemporaryDirectory() as tmp:
             body = self._script(tmp)
@@ -337,6 +361,23 @@ class TestApplyScript(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             body = self._script(tmp)
             body.encode("ascii")   # 不該丟例外
+
+
+class TestHardExit(unittest.TestCase):
+    def test_hard_exit_really_ends_the_process(self):
+        """destroy() 之後行程沒死透，更新就會卡住。這裡用子行程驗證它真的會結束。"""
+        import subprocess
+        code = (
+            "import sys, threading, time;"
+            f"sys.path.insert(0, {ROOT!r});"
+            # 故意留一個不會結束的非 daemon 執行緒 —— 正常 sys.exit() 會被它卡住
+            "t = threading.Thread(target=lambda: time.sleep(300), daemon=False);"
+            "t.start();"
+            "from src import updater;"
+            "updater.hard_exit(0)"
+        )
+        proc = subprocess.run([sys.executable, "-c", code], timeout=30)
+        self.assertEqual(proc.returncode, 0)
 
 
 class TestDevMode(unittest.TestCase):

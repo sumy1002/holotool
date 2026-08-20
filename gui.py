@@ -206,6 +206,10 @@ class HoloToolGUI(tk.Tk):
         # 結果一律透過 queue 交回主執行緒 —— tkinter 元件只能在主執行緒動。
         self._update_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self._update_busy = False
+        # 已經決定要為了更新關閉程式。_pump 看到這個旗標就不再碰任何元件 ——
+        # 元件已經被 destroy() 掉了，繼續碰會丟 TclError，而 windowed 模式下
+        # 那個錯誤看不到，只會表現成「視窗關了、行程還在」。
+        self._quitting = False
 
         self._preview_running = False
         self._preview_queue: queue.Queue[str] = queue.Queue()
@@ -1285,6 +1289,8 @@ class HoloToolGUI(tk.Tk):
     # ------------------------------------------------------- 定時更新
 
     def _pump(self) -> None:
+        if self._quitting:
+            return
         # log
         drained = 0
         while drained < 200:
@@ -1311,6 +1317,9 @@ class HoloToolGUI(tk.Tk):
             except queue.Empty:
                 break
             self._handle_update_event(kind, payload)
+            if self._quitting:
+                # 已經在收尾了，不要再回頭去碰下面那些元件
+                return
 
         self._sync_buttons()
         self._refresh_stats()
@@ -1459,8 +1468,24 @@ class HoloToolGUI(tk.Tk):
                 f"{exc}\n\n請到 Release 頁面手動下載安裝：\n{release.page_url}",
             )
             return
-        logger.log(f"[更新] 即將關閉並套用 v{release.version}")
-        self._on_close()
+        logger.log(f"[更新] 即將關閉並套用 v{release.version}（PID {os.getpid()}）")
+        self._quitting = True
+        # 排到下一個空檔再關，讓這一輪 _pump 先乾淨地結束
+        self.after(50, self._quit_for_update)
+
+    def _quit_for_update(self) -> None:
+        """為了更新關閉程式。**一定要真的讓行程結束。**
+
+        置換用的 .bat 在等這個 PID 從 tasklist 消失才敢動手，所以
+        「視窗關了但行程還活著」對更新來說跟沒關一樣 —— 畫面會停在一個
+        什麼都不做的黑視窗上（實際踩到過這個坑）。
+        所以最後一定要走 hard_exit()，不能只靠 mainloop 自然返回。
+        """
+        try:
+            self._on_close()
+        except Exception:
+            pass
+        updater.hard_exit(0)
 
     # ----------------------------------------------------------- 關閉
 

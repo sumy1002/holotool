@@ -490,10 +490,20 @@ def install_root() -> str:
 
 APPLY_SCRIPT_NAME = "holotool_apply_update.bat"
 
+# 等主程式結束的節奏：先客氣地等，等不到就強制結束。
+#
+# 為什麼需要「強制」這一段：GUI 呼叫 destroy() 之後，行程有可能沒有真的結束
+# （tkinter 回呼裡殘留的狀態、還沒收掉的執行緒、windowed 模式下被吞掉的例外
+# 都會造成這種情形）。這時候 .bat 會一直等一個永遠不會消失的 PID，畫面就停在
+# 一個什麼都不做的黑視窗上。程式那邊已經改成強制結束行程，這裡是第二層保險。
+WAIT_BEFORE_KILL = 15      # 秒。超過就 taskkill
+WAIT_TOTAL = 35            # 秒。連 taskkill 都無效就放棄，什麼都不改
+
 # .bat 一律只用 ASCII。Windows 的 cmd 預設不是 UTF-8，
 # 帶中文的批次檔在某些機器上會整行解析失敗，除錯起來非常痛苦。
 _APPLY_TEMPLATE = """@echo off
 setlocal
+title HoloTool updater
 set "ROOT={root}"
 set "STAGE={stage}"
 set "PID={pid}"
@@ -504,14 +514,28 @@ echo ==== HoloTool update %DATE% %TIME% ==== >> "%LOGFILE%"
 echo root=%ROOT% >> "%LOGFILE%"
 echo stage=%STAGE% >> "%LOGFILE%"
 
-rem --- 1. wait for the running HoloTool.exe to exit (up to 60s) ---
+echo.
+echo   HoloTool is updating. This window closes by itself.
+echo   Log: %LOGFILE%
+echo.
+
+rem --- 1. wait for the running HoloTool.exe to exit ---
+rem     Graceful first; force-kill if it will not go away. The copy step
+rem     cannot start while the exe is still holding its own file open.
 set /a tries=0
 :waitloop
-tasklist /FI "PID eq %PID%" 2>nul | find "%PID%" >nul
+tasklist /NH /FI "PID eq %PID%" 2>nul | find "%PID%" >nul
 if errorlevel 1 goto replace
 set /a tries+=1
-if %tries% GEQ 60 (
-  echo [ERROR] pid %PID% still alive after 60s - aborting, nothing changed >> "%LOGFILE%"
+if %tries%=={kill_after} (
+  echo   Still closing...
+  echo [WARN] pid %PID% alive after {kill_after}s - forcing it to close >> "%LOGFILE%"
+  taskkill /F /PID %PID% >> "%LOGFILE%" 2>&1
+)
+if %tries% GEQ {give_up_after} (
+  echo [ERROR] pid %PID% would not exit - aborting, nothing changed >> "%LOGFILE%"
+  echo   Update aborted: HoloTool did not close. Nothing was changed.
+  ping -n 6 127.0.0.1 >nul
   goto finish
 )
 ping -n 2 127.0.0.1 >nul
@@ -521,9 +545,12 @@ rem --- 2. copy program files over the install dir ---
 rem     No /PURGE: we never delete anything the user owns.
 rem     /XD excludes the user data dirs as a third safety net.
 :replace
+echo   Replacing program files...
 robocopy "%STAGE%" "%ROOT%" /E /R:3 /W:1 /NFL /NDL /NJH /NJS{excludes} >> "%LOGFILE%" 2>&1
 if errorlevel 8 (
   echo [ERROR] robocopy exit code %ERRORLEVEL% - update incomplete >> "%LOGFILE%"
+  echo   Copy failed. See the log above. Your settings were not touched.
+  ping -n 6 127.0.0.1 >nul
   goto finish
 )
 echo [OK] program files replaced >> "%LOGFILE%"
@@ -531,6 +558,7 @@ echo [OK] program files replaced >> "%LOGFILE%"
 rem --- 3. clean up and restart ---
 rmdir /S /Q "%STAGE%" 2>nul
 if exist "%ZIPFILE%" del /F /Q "%ZIPFILE%" 2>nul
+echo   Restarting HoloTool...
 start "" "%ROOT%\\{sentinel}"
 
 :finish
@@ -568,6 +596,8 @@ def write_apply_script(staging: str, root: str, zip_path: str = "",
         zipfile=zip_path,
         excludes=excludes,
         sentinel=SENTINEL,
+        kill_after=WAIT_BEFORE_KILL,
+        give_up_after=WAIT_TOTAL,
     )
     # cmd 對換行不挑，但 CRLF 比較保險；ASCII 編碼確保沒有偷跑進來的中文
     with open(path, "w", encoding="ascii", newline="\r\n") as f:
@@ -576,15 +606,18 @@ def write_apply_script(staging: str, root: str, zip_path: str = "",
 
 
 def launch_apply_script(script: str) -> None:
-    """把 .bat 丟出去背景執行，然後就該讓主程式結束了。
+    """把 .bat 丟出去背景執行，然後就該讓主程式**立刻**結束了。
 
     用 DETACHED_PROCESS 讓它脫離本行程 —— 否則主程式一結束，
     子行程可能跟著被收掉，更新做一半。
+
+    刻意**不加** CREATE_NO_WINDOW：這支腳本會在畫面上待十來秒，
+    有個視窗寫著「正在更新，這個視窗會自己關掉」比一片空白安心得多，
+    出問題時也看得到最後那行錯誤訊息。
     """
     creationflags = 0
     if os.name == "nt":
         creationflags = (getattr(subprocess, "DETACHED_PROCESS", 0)
-                         | getattr(subprocess, "CREATE_NO_WINDOW", 0)
                          | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
     subprocess.Popen(  # noqa: S603  （路徑是我們自己產生的）
         ["cmd", "/c", script],
@@ -592,6 +625,29 @@ def launch_apply_script(script: str) -> None:
         creationflags=creationflags,
         close_fds=True,
     )
+
+
+def hard_exit(code: int = 0) -> None:
+    """**保證**行程結束。呼叫之後不會回來。
+
+    為什麼不能只靠 `root.destroy()` 之後讓 `mainloop()` 自然返回：
+    置換用的 .bat 在等這個 PID 從 `tasklist` 消失才敢動手，所以
+    「視窗關了但行程還在」對更新來說跟沒關一樣 —— 畫面就會停在一個
+    什麼都不做的黑視窗上（實際踩到過）。殘留的執行緒、tkinter 回呼裡
+    的例外、windowed 模式下被吞掉的錯誤都可能造成這種情形。
+
+    `os._exit()` 不跑 atexit、不 flush 緩衝區。這裡可以接受：
+    log 是每寫一行就開檔關檔，設定檔在這個流程裡完全沒被改過。
+    """
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    try:
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(code)
 
 
 # ------------------------------------------------------- 對外的完整流程
