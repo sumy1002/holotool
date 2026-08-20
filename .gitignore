@@ -1,0 +1,66 @@
+# ============================================================================
+# HoloTool .gitignore
+#
+# 判斷原則：
+#   進版控 = 「程式碼、內建預設樣板、文件、測試」—— 換一台電腦重建得出來的
+#   不進版控 = 「你自己的校準、實機抓的樣板、執行紀錄、打包產物、虛擬環境」
+#
+# 特別說明 config\ 與 card_templates\ 為什麼不進版控：
+#   那是你逐格校準的座標（綁著你自己的視窗解析度）與你在實機抓的點數/花色
+#   樣板。放進版控之後，任何一次 git pull / git checkout 都有機會把它們
+#   蓋掉，而那正是之前救不回來的那個坑。要分享給別人用的樣板，請放到
+#   app\defaults\ ——那是「程式內容」，會進版控、也會被打包進 exe，而且
+#   paths.install_default_parts(overwrite=False) 永遠不會蓋掉使用者自己的。
+# ============================================================================
+
+# ---- 你的校準與樣板（絕對不要進版控）----
+app/config/
+app/card_templates/
+app/backups/
+
+# ---- 執行時產生的東西 ----
+app/data/
+app/logs/
+app/debug_captures/
+
+# ---- 虛擬環境 ----
+# .venv 搬過位置就壞（Scripts\*.exe 把建立當下的 python.exe 絕對路徑寫死在
+# 檔頭），所以它天生不能跟著 repo 走。別人 clone 之後自己建一個：
+#     py -m venv app\.venv
+#     app\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv/
+venv/
+env/
+
+# ---- 打包產物與暫存 ----
+app/dist/
+app/packaging/build/
+build/
+*.spec
+app/packaging/icon.ico
+app/defaults/parts.zip
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ---- 舊備份檔（build_exe.py 的 _keep_backup 會產生 .bak / .bak1 / .bak2…）----
+*.bak
+*.bak[0-9]
+*.bak[0-9][0-9]
+
+# ---- 更新流程的暫存（正常在系統 TEMP，這是保險）----
+holotool_apply_update.bat
+HoloTool-update/
+
+# ---- 編輯器與作業系統 ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
