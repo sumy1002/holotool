@@ -2,7 +2,7 @@
 
 要發新版時，這個檔案裡的 `__version__` 是唯一要改的地方：
 
-    __version__ = "1.0.3"
+    __version__ = "1.0.1"
 
 改完之後這三邊會自動跟著變：
   · GUI 主控台「版本與更新」顯示的目前版本
@@ -26,7 +26,7 @@
 """
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.0.5"
 
 # ---------------------------------------------------------------- GitHub
 
@@ -102,7 +102,15 @@ def is_newer(candidate: str, current: str | None = None) -> bool:
 
     版本號解析不出來時一律回傳 False —— 「看不懂就當作沒有新版」比
     「看不懂就叫使用者更新」安全得多。
+
+    `candidate` 是 None 或空字串時直接回 False，**不可以**讓它掉進
+    `version_tuple()` 的預設值 —— 那個預設值是「目前程式版本」，
+    於是 `is_newer(None)` 會變成「拿自己跟 current 比」，一旦
+    `__version__` 比 current 新就回報「有更新」，等於憑空冒出一個
+    不存在的新版本。
     """
+    if not candidate:
+        return False
     try:
         new = version_tuple(candidate)
         old = version_tuple(current)

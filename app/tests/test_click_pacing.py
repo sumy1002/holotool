@@ -32,11 +32,20 @@ def _cfg(**over) -> dict:
     return cfg
 
 
+# 實機量到的「投注畫面」五個牌位中位亮度（五張深色牌背）。
+#
+# 這個檔案裡的「認不出來的畫面」測的是「畫面就是投注畫面，只是標記沒過門檻」，
+# 所以預設要帶投注畫面的亮度。不帶的話 _handle_idle 的投注畫面前置檢查會
+# 直接擋掉，這些測試就變成在測那個檢查，而不是在測點擊節奏。
+BETTING_SLOT_VALUES = [85, 112, 133, 125, 82]
+
+
 def _frame(**kwargs) -> FrameInfo:
     data = dict(
         on_table=True,
         table_marker_score=0.9,
         slot_cards=[None] * 5,
+        slot_values=list(BETTING_SLOT_VALUES),
         highlow_card=None,
         is_draw=False,
         is_congrats=False,
@@ -136,6 +145,31 @@ class TestNoStrayClicksDuringAnimation(PacingTestCase):
         time.sleep(0.35)
         self._run(bot, _frame())
         self.assertIn("start_round", keys, "持續認不出來卻一直不點")
+
+    def test_idle_needs_the_screen_to_actually_look_like_betting(self):
+        """認不出來 ≠ 在等你下注。
+
+        2026-08-21 實機 log：比大小畫面上的牌認不出來、所有標記都沒過門檻，
+        於是每 2.5 秒點一次「投注並開始」，第 4、5、6 次…… 那顆按鈕在比大小
+        畫面上什麼都不會發生，所以永遠不會有進展，也永遠不會停。
+        """
+        highlow_on_screen = [255, 205, 247, 247, 251]   # 就是卡住那張的實測值
+        bot = self._make_bot(idle_confirm_sec=0.3, action_cooldown_sec=0.0)
+        keys = self._watch(bot)
+        self._run(bot, _frame(slot_values=highlow_on_screen), ticks=2)
+        time.sleep(0.35)
+        self._run(bot, _frame(slot_values=highlow_on_screen), ticks=5)
+        self.assertNotIn("start_round", keys,
+                         "在比大小畫面上仍然去點了「投注並開始」")
+
+    def test_unmeasured_slots_never_trigger_a_click(self):
+        """量不到牌位亮度時寧可不動作，也不要在不知道的畫面上亂點。"""
+        bot = self._make_bot(idle_confirm_sec=0.3, action_cooldown_sec=0.0)
+        keys = self._watch(bot)
+        self._run(bot, _frame(slot_values=[]), ticks=2)
+        time.sleep(0.35)
+        self._run(bot, _frame(slot_values=[]), ticks=5)
+        self.assertNotIn("start_round", keys)
 
     def test_recognised_screen_resets_the_idle_timer(self):
         bot = self._make_bot(idle_confirm_sec=0.3, action_cooldown_sec=0.0)

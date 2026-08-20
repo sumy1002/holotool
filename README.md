@@ -30,12 +30,16 @@
 ```
 holotool/
   gui.py                   # ★ 程式本人。雙擊 exe 或跑原始碼都是從這裡進
+  release.bat              # ★ 雙擊一次就發一個新版（見下面「版本號與自動更新」）
   README.md
   requirements.txt
   app/                     # 其餘全部在這裡
     src/                   #   主要程式邏輯
       version.py           #     ★ 版本號的唯一來源 + GitHub repo 位置
       updater.py           #     檢查更新 / 下載 / 驗證 / 備份 / 置換
+      geometry.py          #     比例座標換算 + 16:9 內容框（換比例的關鍵）
+      profiles.py          #     每種視窗長寬比一組校準（16:9 / 21:9 / 4:3）
+      minipanel.py         #     迷你懸浮控制窗（只有啟動/停止）
     tools/                 #   命令列輔助工具
       run_bot.py           #     主程式（命令列版），按 F9 啟動/停止
       calibrate.py         #     校準工具（命令列版）
@@ -48,6 +52,7 @@ holotool/
       build_exe.py         #     打包成 app/dist/HoloTool/HoloTool.exe
       build_installer.py   #     一鍵產生給別人的 app/dist/HoloToolSetup.exe
       make_release.py      #     產生 GitHub Release 用的更新包 + SHA256
+      bump_version.py      #     讀取／修改 src/version.py 的 __version__
       make_icon.py         #     icon.png → icon.ico（多尺寸）
       icon.png             #     程式圖示的來源圖，換圖直接換這個檔
       HoloTool.iss         #     Inno Setup 安裝程式腳本
@@ -143,6 +148,53 @@ app\.venv\Scripts\python.exe gui.py
 取消勾選後若沒重新啟動，不會自動變成會點擊。
 
 啟動後遊戲視窗要保持在最前面。熱鍵 **F9** 啟動/停止、**F10** 緊急停止在 GUI 中同樣有效。
+
+### 只有一個螢幕：用迷你懸浮視窗
+
+主控台右邊有一顆 **「⤡ 縮成迷你視窗」**。按下去主視窗會收起來，只留一個
+釘在最上層的小方塊：一顆狀態燈（綠＝執行中）、一顆啟動／停止、一顆 **▣** 還原主視窗。
+
+- 預設出現在螢幕右下角、工作列上方一點；**拖那顆圓點**可以移動，放手時位置會記進
+  `config.json` 的 `mini_panel`，下次打開還在同一個地方。
+- 顯示前一定會把座標夾回螢幕範圍內。換螢幕或改解析度之後，舊座標很可能落在畫面外，
+  而這個視窗沒有標題列也不出現在工作列 —— 跑出去就真的找不回來了。
+- 萬一迷你視窗在某台電腦上顯示不出來，程式會**維持主視窗開啟**並提示你改用 F9／F10，
+  不會讓你兩個視窗都沒有。
+
+### 視窗長寬比：一組校準，自動換算到所有比例
+
+**遊戲不是依視窗重排 UI。** 它把一個固定 **16:9 的內容框置中**放進視窗，所有 UI 都排在
+那個框裡；只有**背景圖**拉滿整個視窗。因為背景填滿了，看起來沒有黑邊，才會像是重排。
+
+證據（2026-08-21 量三種比例的實機截圖，換算到內容框座標後）：
+
+| 五格手牌 | 16:9 (1474×829) | 4:3 (1269×952) | 差 |
+|---|---|---|---|
+| 牌0 | 0.0725 0.3112 0.1479 0.3703 | 0.0725 0.3109 0.1481 0.3712 | 0.0009 |
+| 牌4 | 0.7809 0.3112 0.1479 0.3703 | 0.7809 0.3109 0.1481 0.3712 | 0.0009 |
+
+一致到 1 個像素。所以**一組校準就能精確算出其他比例**，換算誤差 1~4 像素。
+內建已經有 21:9、16:9、4:3 三組；換到沒見過的比例時程式會自動算一組出來，log 會說明。
+
+唯一的例外是**對話框最下面那排動作按鈕**（取消／進行挑戰／再一次）—— 它們釘在
+**視窗底部**，不在內容框裡。用同一組轉換去預測，差別非常明確：
+
+| 地標 | 內容框預測誤差 | 貼視窗底預測誤差 |
+|---|---|---|
+| 卡片上下緣 | 0.0 px | 118.1 px |
+| 大／小膠囊中心 | 0.3 px | 118.4 px |
+| 取消 上緣 | 118.4 px | **0.3 px** |
+| 進行挑戰 中心 | 111.0 px | **7.1 px** |
+
+樣板縮放倍率也只跟內容框高度有關，跟視窗寬度無關 —— 舊公式用視窗寬度比，在 16:9
+與 4:3 都**差 24%**（只有在接近 21:9 時剛好差不多，所以一直沒被發現）。這就是換比例
+之後畫面標記分數整排掉下來的原因。
+
+想手動覆蓋某個比例的校準，用「校準」分頁的**「視窗長寬比」**區塊：
+
+1. 把遊戲視窗調成那個比例
+2. 按 **「另存為目前比例的校準」**
+3. 重新框選 —— 框完的結果**只會存進這一組**，其他比例完全不受影響
 
 ---
 
@@ -244,14 +296,33 @@ GITHUB_REPO = "holotool"
 
 沒有網路、repo 打錯、GitHub 擋請求時只會在那一行顯示紅字，不會影響其他功能。
 
-### 發一個新版（你這邊要做的）
+### 發一個新版：雙擊 `release.bat`
+
+專案根目錄的 **`release.bat`** 把整個流程包成一次雙擊：
+
+1. 讀出目前版本
+2. 把**現有的** `app\dist\HoloTool\` 複製成 `F:\holotool-test-<目前版本>\`
+   —— 這份是拿來測更新的「舊版」。`make_release.py` 會把 `app\dist\HoloTool\`
+   重新打包成新版本，不先留一份就沒有東西可以更新
+3. 修訂號 +1（改的是 `app\src\version.py`）
+4. 打包、產生 `HoloTool-<新版本>.zip` 與 `.sha256`
+5. 開啟檔案總管選中那兩個檔，並開啟 GitHub 的 new release 頁面（tag 已填好）
+
+你只要把那兩個檔拖進網頁、按 Publish。
+
+想手動控制的話，底下的指令等價：
 
 ```powershell
 cd F:\holotool
-# 1. 先改 app\src\version.py 的 __version__
-# 2. 打包 + 產生更新包 + 算 SHA256
+app\.venv\Scripts\python.exe app\packaging\bump_version.py --print   # 看目前版本
+app\.venv\Scripts\python.exe app\packaging\bump_version.py --bump    # 修訂號 +1
+app\.venv\Scripts\python.exe app\packaging\bump_version.py --set 1.3.0
 app\.venv\Scripts\python.exe app\packaging\make_release.py
 ```
+
+> `bump_version.py` 只會改**行首**那個 `__version__` 定義。`version.py` 的說明
+> 文字裡有一行縮排過的 `    __version__ = "1.0.1"` 當範例，那一行不能被動到，
+> 有測試 (`test_bump_version.py`) 專門守這件事。
 
 跑完會產生兩個檔並印出後續步驟：
 
@@ -425,9 +496,9 @@ git push
 所以校準完之後你可以**自由移動與縮放視窗**，不需要重新校準，程式會依視窗當下的
 實際尺寸即時換算。但要注意：
 
-- **長寬比必須維持一致**。長寬比一改變，遊戲本身的 UI 排版通常也會跟著變動，
-  比例座標就對不上了。程式在按下 F9 時會比較目前長寬比與校準時的差異，
-  超過 `aspect_ratio_tolerance`（預設 2%）就會在 log 發出警告。
+- **長寬比改變時會自動換算座標**。遊戲的 UI 排在一個置中的 16:9 內容框裡（見上面
+  「視窗長寬比」），所以換比例時程式會從最接近的那組**算**出正確座標，誤差 1~4 像素，
+  不需要重新校準。誤差在 `aspect_ratio_tolerance`（預設 2%）以內算同一種比例、直接沿用。
 - **不要縮得太小**。視窗越小，每張牌的像素越少，不同牌的樣板分數會越靠近而難以區分。
   建議讓每張牌至少保有 60～80 像素寬；縮到校準時的 0.6 倍以下時程式也會提醒你。
 - **不能最小化，也不能被其他視窗蓋住**，因為程式是直接讀取螢幕上那塊區域的像素。
@@ -518,8 +589,11 @@ app\.venv\Scripts\python.exe app\tools\run_bot.py --dry-run
 | `part_min_margin` | 點數最高分需領先第二名多少才採信，預設 0.05 |
 | `match_threshold` | （備援用）整張卡面比對的相似度門檻 |
 | `min_match_margin` | （備援用）整張卡面比對的領先幅度門檻 |
-| `calibration` | 校準當時的視窗尺寸，用來偵測長寬比是否改變（校準時自動寫入） |
-| `aspect_ratio_tolerance` | 長寬比容許誤差，超過就警告，預設 0.02（2%） |
+| `calibration` | 目前生效那一組校準當時的視窗尺寸（校準時自動寫入） |
+| `aspect_ratio_tolerance` | 長寬比容許誤差，誤差在此以內算同一種比例，預設 0.02（2%） |
+| `calibration_profiles` | 每種長寬比一組校準（label / client_width / client_height / regions / points）。`derived_from` 有值代表是換算出來的。不要手改，用 GUI 的「視窗長寬比」區塊 |
+| `active_profile` | 目前生效的組別 label。`null` 代表正在借用別的比例的座標 |
+| `mini_panel` | 迷你懸浮視窗上次的位置 `{x, y}` |
 | `templates.capture_client_width` | **擷取六個畫面標記樣板時的視窗寬度**。樣板是點陣圖，比對前會依「目前視窗寬 ÷ 這個值」縮放；重新框選標記時會自動更新 |
 | `marker_thresholds` | 六個畫面標記各自的比對門檻（牌桌/選牌/過關/翻倍/失敗/湊牌失敗） |
 | `marker_pads` | 各標記往外擴張搜尋的量 `[左右, 上下]`，單位是該區域自身的寬/高比例 |
@@ -631,6 +705,12 @@ app\.venv\Scripts\python.exe app\tools\check_markers.py app\debug_captures    # 
 
 - **今天的達成次數算錯了**（例如自己先手動玩過一次）：打開
   `data/stats_YYYY-MM-DD.json`，把 `max_win_count` 改成正確的數字即可。
+
+- **改了 `__version__`，打包出來卻還是舊版本號**：**先確認你開的是哪一個 exe。**
+  重新打包只會更新 `F:\holotool\app\dist\HoloTool\HoloTool.exe`。
+  如果你之前跑過 `HoloToolSetup.exe`，那份裝在 `%LOCALAPPDATA%\HoloTool`
+  的複本（以及安裝程式建立的開始選單／桌面捷徑）**不會**因為重新打包而改變。
+  `build_exe.py` 現在會在開頭與結尾各印一次版本號和該開哪個路徑。
 
 - **按「檢查更新」說找不到 repo（HTTP 404）**：`app\src\version.py` 的
   `GITHUB_OWNER` / `GITHUB_REPO` 打錯，或那個 repo 還沒發過任何 Release。

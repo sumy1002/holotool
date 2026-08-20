@@ -15,6 +15,7 @@ import _bootstrap  # noqa: F401  讓這個子資料夾找得到專案根目錄�
 
 from src import window as win_mod
 from src.config import CONFIG_PATH, load_config
+from src import profiles as profiles_mod
 from src.geometry import aspect_ratio_delta, scale_factor
 from src.handeval import full_deck
 from src.paths import template_dir
@@ -78,27 +79,41 @@ def main() -> None:
             rect = win_mod.get_client_rect_on_screen(hwnd)
             print(f"{OK} 遊戲視窗：找到「{title}」，目前尺寸 {rect.width}x{rect.height}")
 
+            tol = cfg.get("aspect_ratio_tolerance", 0.02)
+            aspect_label = profiles_mod.label_for(rect.width, rect.height)
+            match, delta_profile = profiles_mod.find_match(cfg, rect.width, rect.height, tol)
+            if match is None:
+                print(f"{NG} 長寬比 {aspect_label}：一組校準都沒有")
+                todo.append("到「校準」分頁依序校準全部項目")
+            elif delta_profile > tol:
+                print(f"{NG} 長寬比 {aspect_label}：沒有這個比例的校準，"
+                      f"會借用「{match.get('label')}」（差 {delta_profile:.1%}），位置會歪")
+                todo.append(f"在 {aspect_label} 下按「另存為目前比例的校準」後重新框選")
+            elif match.get("seeded_from"):
+                print(f"{NG} 長寬比 {aspect_label}：這組是從「{match['seeded_from']}」"
+                      "複製來的，還沒真正校準過")
+                todo.append(f"在 {aspect_label} 下重新框選一次")
+            else:
+                print(f"{OK} 長寬比 {aspect_label}：使用「{match.get('label')}」這一組校準")
+
             ref = cfg.get("calibration", {})
             ref_w, ref_h = ref.get("client_width", 0), ref.get("client_height", 0)
             if ref_w > 0 and ref_h > 0:
                 delta = aspect_ratio_delta(rect.width, rect.height, ref_w, ref_h)
                 scale = scale_factor(rect.width, ref_w)
-                tol = cfg.get("aspect_ratio_tolerance", 0.02)
-                msg = f"校準時 {ref_w}x{ref_h}，目前縮放 {scale:.2f} 倍，長寬比差異 {delta:.1%}"
-                if delta > tol:
-                    print(f"{NG} 長寬比：{msg} — 超過容許值 {tol:.1%}，座標會對不上！")
-                    todo.append("把視窗調回原本的長寬比，或重新執行 calibrate.py")
-                else:
-                    print(f"{OK} 長寬比：{msg}")
+                print(f"       ↳ 這組量於 {ref_w}x{ref_h}，目前縮放 {scale:.2f} 倍，"
+                      f"長寬比差異 {delta:.1%}")
                 if scale < 0.6:
                     print(f"       ↳ 提醒：視窗偏小，卡牌辨識率可能下降，建議放大一點")
 
-    # 3. 校準尺寸紀錄
-    ref = cfg.get("calibration", {})
-    if ref.get("client_width", 0) > 0:
-        print(f"{OK} 校準尺寸紀錄：{ref['client_width']}x{ref['client_height']}")
+    # 3. 各長寬比的校準組
+    lines = profiles_mod.describe(cfg)
+    if lines:
+        print(f"{OK} 已存的校準組（{len(lines)} 組）：")
+        for line in lines:
+            print(f"       • {line}")
     else:
-        print(f"{NG} 校準尺寸紀錄：尚未記錄")
+        print(f"{NG} 校準組：尚未建立任何一組")
 
     # 4. 區域
     regions = cfg.get("regions", {})

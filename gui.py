@@ -54,6 +54,7 @@ from src.bot import Bot
 from src.capture import GameCapture
 from src.config import (
     CONFIG_VERSION,
+    DEFAULT_CONFIG,
     apply_screenshot_layout,
     get_by_path,
     load_config,
@@ -63,6 +64,8 @@ from src.config import (
 )
 from src.defaults_layout import UI_MARKER_FILES
 from src.controller import HotkeyManager
+from src import profiles as profiles_mod
+from src.minipanel import MiniPanel
 from src.geometry import aspect_ratio_delta, pixels_point_to_ratio, pixels_region_to_ratio, scale_factor
 from src.handeval import Card
 from src.overlay import CalibrationPreview, select_point, select_region
@@ -314,6 +317,9 @@ class HoloToolGUI(tk.Tk):
         self.stop_btn = ttk.Button(ctrl_box, text="■ 停止", command=self._stop_bot, state=tk.DISABLED)
         self.stop_btn.grid(row=0, column=2, padx=6, pady=8)
 
+        ttk.Button(ctrl_box, text="⤡ 縮成迷你視窗", command=self._show_mini_panel
+                   ).grid(row=0, column=3, padx=6, pady=8)
+
         self.dry_run_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(ctrl_box, text="除錯模式（只判斷、不實際點擊。每次按啟動會依目前勾選狀態套用）",
                         variable=self.dry_run_var).grid(row=1, column=0, columnspan=3, padx=10, sticky="w")
@@ -384,6 +390,28 @@ class HoloToolGUI(tk.Tk):
         self.preview_all_btn = ttk.Button(btn_row, text="預覽全部框選", command=self._toggle_preview_all)
         self.preview_all_btn.pack(side=tk.LEFT, padx=6)
         ttk.Button(btn_row, text="重新整理狀態", command=self._refresh_calib_status).pack(side=tk.LEFT, padx=6)
+
+        prof_box = ttk.LabelFrame(frame, text="視窗長寬比（16:9 / 21:9 / 4:3 各存一組校準）")
+        prof_box.pack(fill=tk.X, padx=10, pady=(10, 0))
+        ttk.Label(
+            prof_box,
+            text="遊戲換長寬比時排版會跟著動，所以每種比例各存一組座標，程式依視窗當下的比例自動挑。\n"
+                 "沒有對應那一組時會先借最接近的頂著（位置會歪），這時按下面那顆先建立一組，再重新框選。\n"
+                 "校準完存檔只會寫進「生效中」那一組，不會動到其他比例的校準。",
+            foreground="#555", justify="left",
+        ).pack(anchor="w", padx=8, pady=(6, 2))
+
+        prof_row = ttk.Frame(prof_box)
+        prof_row.pack(fill=tk.X, padx=8, pady=(0, 6))
+        ttk.Button(prof_row, text="另存為目前比例的校準",
+                   command=self._save_profile_for_current).pack(side=tk.LEFT, padx=(0, 6))
+        self.profile_combo = ttk.Combobox(prof_row, state="readonly", width=14, values=[])
+        self.profile_combo.pack(side=tk.LEFT, padx=(6, 4))
+        ttk.Button(prof_row, text="刪除這一組",
+                   command=self._delete_selected_profile).pack(side=tk.LEFT, padx=4)
+
+        self.profile_status = ttk.Label(prof_box, text="", foreground="#06c", justify="left")
+        self.profile_status.pack(anchor="w", padx=8, pady=(0, 8))
 
         self.calib_progress = ttk.Label(frame, text="滑鼠移到項目上即可預覽框選位置",
                                         font=("Microsoft JhengHei", 11, "bold"), foreground="#06c")
@@ -521,7 +549,9 @@ class HoloToolGUI(tk.Tk):
                 current = ""
             var = tk.StringVar(value=str(current))
             self.setting_vars[key] = var
-            ttk.Entry(box, textvariable=var, width=12).grid(row=row, column=1, padx=4, pady=4)
+            entry = ttk.Entry(box, textvariable=var, width=12)
+            entry.grid(row=row, column=1, padx=4, pady=4)
+            self._allow_numpad_decimal(entry)
             ttk.Label(box, text=hint, foreground="#777", wraplength=380,
                       justify="left").grid(row=row, column=2, sticky="w", padx=8)
         box.columnconfigure(2, weight=1)
@@ -535,7 +565,60 @@ class HoloToolGUI(tk.Tk):
                         variable=self.failsafe_var).grid(
             row=opt_row + 1, column=0, columnspan=3, sticky="w", padx=4, pady=4)
 
-        ttk.Button(frame, text="儲存設定", command=self._save_settings).pack(anchor="w", padx=14, pady=12)
+        ttk.Label(frame,
+                  text="小數點打不進去的話（中文輸入法常會吃掉數字鍵盤那顆「.」），"
+                       "直接打「。」「，」或全形數字都可以，存檔時會自動換成半角。",
+                  foreground="#777", wraplength=560, justify="left").pack(
+                      anchor="w", padx=10, pady=(10, 0))
+
+        btn_row = ttk.Frame(frame)
+        btn_row.pack(anchor="w", padx=14, pady=12)
+        ttk.Button(btn_row, text="儲存設定", command=self._save_settings).pack(side=tk.LEFT)
+        ttk.Button(btn_row, text="全部還原成預設值",
+                   command=self._reset_settings_to_default).pack(side=tk.LEFT, padx=(8, 0))
+
+    def _allow_numpad_decimal(self, entry: tk.Widget) -> None:
+        """讓數字鍵盤那顆小數點在中文輸入法下也能用。
+
+        Tk 收到的 keysym 是 KP_Decimal，但輸入法可能把字元換成「。」或整個吃掉。
+        直接綁 keysym 自己插入一個半角句號，就跟輸入法狀態無關了。
+        """
+        def insert_dot(_event=None):
+            try:
+                entry.insert(tk.INSERT, ".")
+            except tk.TclError:
+                return None
+            return "break"
+
+        for sequence in ("<KP_Decimal>", "<KP_Separator>"):
+            try:
+                entry.bind(sequence, insert_dot)
+            except tk.TclError:
+                pass   # 某些 Tk 版本沒有這個 keysym，忽略即可
+
+    def _reset_settings_to_default(self) -> None:
+        """把設定欄位填回程式內建預設值（**只改畫面上的欄位，不會存檔**）。
+
+        刻意不直接寫進 config：使用者可以先看到預設值是多少，決定要不要按儲存。
+        校準座標與樣板完全不在這個範圍內，不會被動到。
+        """
+        if not messagebox.askyesno(
+            "還原成預設值？",
+            "會把上面每一個數值欄位填回程式內建的預設值。\n\n"
+            "校準座標與卡牌樣板不會被動到。\n"
+            "填回來之後還要按「儲存設定」才會真的生效，不想要就直接切走分頁。",
+        ):
+            return
+        restored = 0
+        for key, var in self.setting_vars.items():
+            try:
+                var.set(str(get_by_path(DEFAULT_CONFIG, key)))
+                restored += 1
+            except (KeyError, IndexError, TypeError):
+                continue
+        self.ace_high_var.set(bool(DEFAULT_CONFIG.get("ace_high", True)))
+        self.failsafe_var.set(bool(DEFAULT_CONFIG.get("pyautogui_failsafe", True)))
+        logger.log(f"已把 {restored} 個設定欄位填回預設值（還沒存檔）")
 
     # ------------------------------------------------------- 視窗 / 狀態
 
@@ -560,9 +643,15 @@ class HoloToolGUI(tk.Tk):
         _hwnd, title = self._windows[idx]
         self.cfg["window_title_substring"] = title
         self.cfg["config_version"] = CONFIG_VERSION
+        # 這裡**故意不動** cfg["calibration"]。
+        # 舊版會把「目前視窗尺寸」直接寫成校準尺寸，但座標一個都沒重新量 ——
+        # 結果是把視窗調成別的長寬比、按一下「使用此視窗」，長寬比警告就消失了，
+        # 而所有框選其實還是上一個比例的值。沉默地壞掉比報錯難查得多。
+        # 校準尺寸只有在真的重新框選（_run_calibration）時才該更新。
         try:
             rect = win_mod.get_client_rect_on_screen(self._windows[idx][0])
-            self.cfg["calibration"] = {"client_width": rect.width, "client_height": rect.height}
+            selection = profiles_mod.select_for_window(self.cfg, rect.width, rect.height)
+            logger.log(profiles_mod.summarize_selection(selection))
         except Exception:
             pass
         save_config(self.cfg)
@@ -587,16 +676,31 @@ class HoloToolGUI(tk.Tk):
         rect = win_mod.get_client_rect_on_screen(hwnd)
         ref = self.cfg.get("calibration", {})
         ref_w, ref_h = ref.get("client_width", 0), ref.get("client_height", 0)
-        msg = f"已鎖定「{title}」  目前尺寸 {rect.width}x{rect.height}"
+        aspect_label = profiles_mod.label_for(rect.width, rect.height)
+        msg = f"已鎖定「{title}」  目前尺寸 {rect.width}x{rect.height}（{aspect_label}）"
         color = "#0a6"
+
+        # 目前這個長寬比有沒有專屬的校準？沒有的話一定要講，因為位置會歪。
+        match, delta_profile = profiles_mod.find_match(
+            self.cfg, rect.width, rect.height,
+            self.cfg.get("aspect_ratio_tolerance", 0.02))
+        tolerance = self.cfg.get("aspect_ratio_tolerance", 0.02)
+        if match is None:
+            msg += "  ⚠ 還沒有任何校準"
+            color = "#c33"
+        elif delta_profile > tolerance:
+            msg += f"  ⚠ 沒有 {aspect_label} 的校準，借用「{match.get('label')}」（差 {delta_profile:.1%}）"
+            color = "#c33"
+        elif match.get("seeded_from"):
+            msg += f"  ⚠ {aspect_label} 這組是從「{match['seeded_from']}」複製的，尚未校準"
+            color = "#c60"
+        else:
+            msg += f"  |  使用 {match.get('label')} 的校準"
+
         if ref_w > 0 and ref_h > 0:
-            delta = aspect_ratio_delta(rect.width, rect.height, ref_w, ref_h)
             scale = scale_factor(rect.width, ref_w)
-            msg += f"  |  校準時 {ref_w}x{ref_h}，縮放 {scale:.2f} 倍"
-            if delta > self.cfg.get("aspect_ratio_tolerance", 0.02):
-                msg += f"  ⚠ 長寬比差 {delta:.1%}，座標可能對不上"
-                color = "#c33"
-            elif scale < 0.6:
+            msg += f"（量於 {ref_w}x{ref_h}，縮放 {scale:.2f} 倍）"
+            if color == "#0a6" and scale < 0.6:
                 msg += "  ⚠ 視窗偏小，辨識率可能下降"
                 color = "#c60"
         self.window_status.config(text=msg, foreground=color)
@@ -604,6 +708,7 @@ class HoloToolGUI(tk.Tk):
     # ----------------------------------------------------------- 校準
 
     def _refresh_calib_status(self) -> None:
+        self._refresh_profiles()
         self.calib_tree.delete(*self.calib_tree.get_children())
         for i, (kind, path, name, _hint, _group) in enumerate(CALIB_TARGETS):
             value = get_by_path(self.cfg, path)
@@ -743,6 +848,82 @@ class HoloToolGUI(tk.Tk):
 
     def _calibrate_all(self) -> None:
         self._run_calibration(CALIB_TARGETS)
+
+    # ------------------------------------------------- 長寬比校準組
+
+    def _refresh_profiles(self) -> None:
+        if not hasattr(self, "profile_status"):
+            return
+        lines = profiles_mod.describe(self.cfg)
+        labels = [p.get("label", "?") for p in profiles_mod.get_profiles(self.cfg)]
+        self.profile_combo.config(values=labels)
+        if labels and not self.profile_combo.get():
+            self.profile_combo.set(self.cfg.get("active_profile") or labels[0])
+
+        hwnd = self._find_hwnd()
+        head = ""
+        if hwnd is not None:
+            try:
+                rect = win_mod.get_client_rect_on_screen(hwnd)
+                label = profiles_mod.label_for(rect.width, rect.height)
+                match, delta = profiles_mod.find_match(
+                    self.cfg, rect.width, rect.height,
+                    self.cfg.get("aspect_ratio_tolerance", 0.02))
+                tolerance = self.cfg.get("aspect_ratio_tolerance", 0.02)
+                if match is not None and delta <= tolerance:
+                    head = f"目前視窗 {rect.width}x{rect.height} = {label}，使用「{match.get('label')}」這一組\n"
+                else:
+                    borrowed = match.get("label") if match else "（無）"
+                    head = (f"目前視窗 {rect.width}x{rect.height} = {label}，"
+                            f"沒有這個比例的校準，正借用「{borrowed}」\n")
+            except Exception:
+                head = ""
+        body = "\n".join(f"　• {line}" for line in lines) if lines else "　（還沒有任何校準組）"
+        self.profile_status.config(text=head + body)
+
+    def _save_profile_for_current(self) -> None:
+        hwnd = self._find_hwnd()
+        if hwnd is None:
+            messagebox.showerror("找不到遊戲視窗",
+                                 "請先在「主控台」分頁選擇遊戲視窗，並確認遊戲正在執行。")
+            return
+        rect = win_mod.get_client_rect_on_screen(hwnd)
+        label = profiles_mod.label_for(rect.width, rect.height)
+        tolerance = self.cfg.get("aspect_ratio_tolerance", 0.02)
+        existing, delta = profiles_mod.find_match(self.cfg, rect.width, rect.height, tolerance)
+        if existing is not None and delta <= tolerance:
+            if not messagebox.askyesno(
+                "覆蓋這一組校準？",
+                f"「{existing.get('label')}」已經有一組校準（量於 "
+                f"{existing.get('client_width')}x{existing.get('client_height')}）。\n\n"
+                "要用目前畫面上的座標覆蓋它嗎？\n"
+                "（其他比例的校準不會被動到）",
+            ):
+                return
+        profiles_mod.save_as(self.cfg, rect.width, rect.height, label)
+        save_config(self.cfg)
+        self._refresh_profiles()
+        self._update_window_status()
+        logger.log(f"已建立／更新「{label}」的校準組（{rect.width}x{rect.height}）。"
+                   "接著請針對這個比例重新框選一次，框完的結果只會存進這一組。")
+
+    def _delete_selected_profile(self) -> None:
+        label = self.profile_combo.get()
+        if not label:
+            messagebox.showinfo("尚未選擇", "請先從旁邊的清單選一組要刪除的比例。")
+            return
+        if not messagebox.askyesno(
+            "刪除校準組？",
+            f"要刪掉「{label}」這一組校準嗎？\n\n"
+            "這組裡面的框選座標會一起消失，無法復原（其他比例不受影響）。",
+        ):
+            return
+        if profiles_mod.remove(self.cfg, label):
+            save_config(self.cfg)
+            self.profile_combo.set("")
+            self._refresh_profiles()
+            self._update_window_status()
+            logger.log(f"已刪除「{label}」的校準組。")
 
     def _run_calibration(self, targets: list[tuple[str, str, str, str, str]]) -> None:
         hwnd = self._find_hwnd()
@@ -1142,9 +1323,26 @@ class HoloToolGUI(tk.Tk):
     _INT_SETTINGS = {"monte_carlo_samples", "highlow_max_chain", "exit_table_ticks",
                      "daily_max_wins"}
 
+    # 全形句號、頓號、逗號、間隔號都當成小數點。
+    #
+    # 中文輸入法開著的時候，數字鍵盤那顆「.」常常打出「。」或根本吃不進去，
+    # 使用者只能改按主鍵盤上「>」那一顆。與其要求他先切輸入法，不如全部接受 ——
+    # 這些字元在數字欄位裡不可能有別的意思。
+    _DECIMAL_ALIASES = str.maketrans({
+        "。": ".", "．": ".", "、": ".", "，": ".", ",": ".", "·": ".", "‧": ".",
+        "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
+        "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
+    })
+
+    @classmethod
+    def _normalize_number(cls, raw: str) -> str:
+        return raw.strip().translate(cls._DECIMAL_ALIASES)
+
     def _save_settings(self) -> None:
         for key, var in self.setting_vars.items():
-            raw = var.get().strip()
+            raw = self._normalize_number(var.get())
+            if raw != var.get().strip():
+                var.set(raw)          # 讓使用者看到程式實際收到什麼
             try:
                 value = int(raw) if key in self._INT_SETTINGS else float(raw)
             except ValueError:
@@ -1225,6 +1423,66 @@ class HoloToolGUI(tk.Tk):
                                 foreground="#0a6" if running else "#666")
         self.start_btn.config(state=tk.DISABLED if running else tk.NORMAL)
         self.stop_btn.config(state=tk.NORMAL if running else tk.DISABLED)
+        mini = getattr(self, "_mini_panel", None)
+        if mini is not None and mini.winfo_exists():
+            mini.set_running(running)
+
+    # --------------------------------------------------- 迷你懸浮視窗
+
+    def _show_mini_panel(self) -> None:
+        """把主視窗收起來，只留一顆啟動/停止釘在最上層。
+
+        給只有一個螢幕的人用：主視窗會蓋住遊戲，而 Alt+Tab 切回來的瞬間
+        遊戲就失去焦點了。
+        """
+        saved = self.cfg.get("mini_panel") or {}
+        position = None
+        if isinstance(saved.get("x"), int) and isinstance(saved.get("y"), int):
+            position = (saved["x"], saved["y"])
+
+        existing = getattr(self, "_mini_panel", None)
+        if existing is not None and existing.winfo_exists():
+            existing.destroy()
+
+        self._mini_panel = MiniPanel(
+            self,
+            on_start=self._start_bot,
+            on_stop=self._stop_bot,
+            on_restore=self._restore_from_mini,
+            on_move=self._remember_mini_position,
+            position=position,
+        )
+        self._mini_panel.set_running(self.bot is not None and self.bot.running)
+
+        # 先確認迷你視窗真的畫出來了，才敢把主視窗收起來。
+        # 萬一它沒顯示（overrideredirect 在某些環境會出怪事），收起主視窗之後
+        # 使用者就會兩個窗都沒有 —— 沒有標題列、沒有工作列項目，只剩 F9 能按。
+        self.update_idletasks()
+        self.update()
+        if not self._mini_panel.winfo_ismapped():
+            self._mini_panel.destroy()
+            self._mini_panel = None
+            messagebox.showwarning(
+                "迷你視窗無法顯示",
+                "這台電腦上的迷你視窗沒有正常出現，主視窗維持開啟以免你找不回來。\n"
+                "可以改用全域熱鍵 F9 啟動／停止、F10 緊急停止。",
+            )
+            return
+        self.withdraw()
+
+    def _restore_from_mini(self) -> None:
+        mini = getattr(self, "_mini_panel", None)
+        if mini is not None and mini.winfo_exists():
+            mini.destroy()
+        self._mini_panel = None
+        self.deiconify()
+        self.lift()
+
+    def _remember_mini_position(self, x: int, y: int) -> None:
+        """拖曳結束才存，不是每個 motion 事件都存 —— 拖一次會觸發上百次事件，
+        每次都寫檔會讓拖曳變得一頓一頓的，而且 config.json 被反覆改寫。"""
+        self.cfg["mini_panel"] = {"x": int(x), "y": int(y)}
+        save_config(self.cfg)
 
     # --------------------------------------------------- 即時辨識預覽
 
@@ -1491,6 +1749,9 @@ class HoloToolGUI(tk.Tk):
 
     def _on_close(self) -> None:
         self._preview_running = False
+        mini = getattr(self, "_mini_panel", None)
+        if mini is not None and mini.winfo_exists():
+            mini.destroy()
         self._hide_calib_preview()
         if hasattr(self, "_calib_overlay"):
             self._calib_overlay.destroy()

@@ -226,9 +226,30 @@ def _backup_dist() -> str:
         return ""
 
 
+def _print_version_banner() -> str:
+    """把「這次要打包的是哪個版本」印在最前面。
+
+    2026-08-20 浪費過一輪：改了 version.py 但看到的還是舊版本號，
+    其實是在看另一個資料夾的 exe（安裝版）。版本號印在開頭與結尾各一次，
+    就不會再有「到底打包成功了沒」的疑問。
+    """
+    if ROOT not in sys.path:
+        sys.path.insert(0, ROOT)
+    try:
+        from src.version import __version__ as version
+    except ImportError:
+        return "?"
+    print("=" * 60)
+    print(f"  要打包的版本：v{version}")
+    print(f"  來源：{os.path.join(ROOT, 'src', 'version.py')}")
+    print("=" * 60)
+    return version
+
+
 def main() -> None:
     os.chdir(ROOT)
 
+    version = _print_version_banner()
     backup = _backup_dist()
     if backup:
         print(f"已備份目前的 dist\\HoloTool → {backup}")
@@ -359,9 +380,16 @@ def main() -> None:
         _create_shortcut(exe_path, os.path.join(desktop, "HoloTool.lnk"), DIST_DIR)
 
     print()
-    print("打包完成。請雙擊開啟：")
-    print(f"  {exe_path}")
-    print("或使用桌面上的 HoloTool 捷徑。")
+    print("=" * 60)
+    print(f"  打包完成：v{version}")
+    print()
+    print("  ★ 一定要開這一個檔案，才會看到新版本：")
+    print(f"    {exe_path}")
+    print()
+    print("  桌面捷徑可能指向別的地方（例如用 HoloToolSetup.exe 安裝到")
+    print("  %LOCALAPPDATA%\\HoloTool 的那一份）。那一份不會因為重新打包")
+    print("  而更新 —— 看到舊版本號時，先確認你開的是上面那個路徑。")
+    print("=" * 60)
     print("設定檔與卡牌樣板會存在 exe 同一個資料夾裡。")
 
 

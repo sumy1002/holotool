@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 
+from . import profiles as profiles_mod
 from .defaults_layout import (
     SCREENSHOT_CLIENT_HEIGHT,
     SCREENSHOT_CLIENT_WIDTH,
@@ -23,7 +24,9 @@ CONFIG_PATH = config_path()
 #   1 = 舊的像素座標
 #   2 = 比例座標
 #   3 = 牌面比對改成「先對位再比」，辨識門檻整組重新調過
-CONFIG_VERSION = 3
+#   4 = 校準改成「每種長寬比一組」（calibration_profiles）。
+#       舊的頂層 regions/points 會被原封不動搬進第一組 profile。
+CONFIG_VERSION = 4
 
 # 升級到某個版本時，這些欄位要強制吃新的預設值。
 # 舊設定檔裡存著舊的調校數字，_deep_merge 會讓「使用者的舊值」蓋掉新預設，
@@ -45,8 +48,16 @@ DEFAULT_CONFIG = {
     # 主迴圈每次偵測畫面的間隔秒數，太小會佔用過多CPU，太大會反應變慢
     "capture_interval_sec": 0.4,
 
-    # 卡牌樣板比對的相似度門檻 (0~1)，數值越高越嚴格
-    "match_threshold": 0.83,
+    # 「整張卡面」樣板比對的相似度門檻 (0~1)，數值越高越嚴格。
+    #
+    # 預設 0.5 是使用者實測調出來的：牌面辨識早就改成讀左上角的點數＋花色小樣板
+    # （part_min_score / part_min_margin 在把關），整張卡面比對只是備援路徑，
+    # 門檻壓在 0.83 太嚴格反而讓備援完全不會生效。
+    #
+    # 注意這只是「新設定檔」的預設值。已經有 config.json 的人不會被改掉 ——
+    # `_deep_merge` 讓使用者的舊值贏，而這一項刻意**沒有**放進 RETUNED_ON_UPGRADE。
+    # 想吃這個預設就到「設定」分頁按「全部還原成預設值」。
+    "match_threshold": 0.5,
 
     # 最高分與第二名之間至少要差多少才採信辨識結果（避免把相近的牌認錯）。
     # 視窗縮得越小，各張牌的分數會越接近，此時可略微調低，但太低容易誤判。
@@ -145,8 +156,17 @@ DEFAULT_CONFIG = {
     # 校準當時的視窗用戶端尺寸；截圖預設是依 1024×438 量的，長寬比接近即可
     "calibration": {"client_width": 1024, "client_height": 438},
 
-    # 長寬比容許誤差，超過此比例就會發出警告（0.02 = 2%）
+    # 長寬比容許誤差。誤差在這個範圍內就算「同一種比例」，可以共用同一組校準；
+    # 超過就會去找／建立另一組（見 src/profiles.py）。0.02 = 2%。
     "aspect_ratio_tolerance": 0.02,
+
+    # 每種長寬比一組校準。空的時候 load_config() 會把下面的 regions/points
+    # 原封不動搬進第一組。詳細規則見 src/profiles.py 的說明。
+    "calibration_profiles": [],
+
+    # 目前生效的是哪一組（profile 的 label）。None 代表「正在借用別的比例的座標」，
+    # 這個狀態下存檔**不會**寫回被借的那一組，而是生出一組屬於目前比例的新的。
+    "active_profile": None,
 
     # 以下座標全部為比例值 (0~1)，相對於視窗用戶端寬/高
     # 預設值依 1024×438 截圖框選；可在校準分頁微調
@@ -177,8 +197,10 @@ DEFAULT_CONFIG = {
 def load_config() -> dict:
     ensure_runtime_dirs()
     if not os.path.exists(CONFIG_PATH):
-        save_config(DEFAULT_CONFIG)
-        return json.loads(json.dumps(DEFAULT_CONFIG))
+        fresh = json.loads(json.dumps(DEFAULT_CONFIG))
+        profiles_mod.ensure_profiles(fresh)
+        save_config(fresh)
+        return fresh
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         cfg = json.load(f)
 
@@ -187,9 +209,18 @@ def load_config() -> dict:
     merged = _deep_merge(json.loads(json.dumps(DEFAULT_CONFIG)), cfg)
 
     retuned = _apply_retuning(merged, old_version)
-    if retuned:
+
+    # 把舊設定檔的頂層 regions/points 搬進 profile。座標值一個都不改。
+    migrated = profiles_mod.ensure_profiles(merged)
+    if migrated:
+        label = merged.get("active_profile") or "?"
+        print(f"[設定升級] 校準資料已收進「{label}」這一組（座標未變動）。"
+              "之後每種視窗長寬比可以各存一組，程式會依視窗當下的比例自動挑。")
+
+    if retuned or migrated:
         merged["config_version"] = CONFIG_VERSION
         save_config(merged)
+    if retuned:
         print(f"[設定升級] 已把重新調校過的參數換成新預設：{', '.join(retuned)}")
 
     legacy_fields = find_legacy_pixel_coords(merged)
@@ -272,9 +303,21 @@ def find_legacy_pixel_coords(cfg: dict) -> list[str]:
 
 
 def save_config(cfg: dict) -> None:
+    """存檔。**存之前一定會把頂層 regions/points 寫回生效中的那一組 profile。**
+
+    這件事刻意放在這裡而不是叫各處自己記得：忘記同步的後果是使用者剛剛校準好的
+    座標下次啟動就被舊 profile 蓋回去 —— 沉默地弄丟校準資料，正是這個專案
+    最不能再犯的錯。
+    """
     os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    profiles_mod.sync_active(cfg)
+    # "_" 開頭的是執行期狀態（例如借用中的暫存標籤），不寫進檔案
+    payload = {k: v for k, v in cfg.items() if not k.startswith("_")}
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    # 先寫暫存再換掉：寫入中途斷掉不會留下半截的 config.json
+    os.replace(tmp, CONFIG_PATH)
 
 
 def apply_screenshot_layout(cfg: dict, *, install_templates: bool = True) -> dict:

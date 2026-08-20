@@ -6,6 +6,7 @@ import time
 
 from .capture import GameCapture
 from .controller import HotkeyManager, MouseController
+from . import profiles as profiles_mod
 from .geometry import aspect_ratio_delta, scale_factor
 from .handeval import Card, classify_hand, hand_name
 from .logger import log
@@ -18,7 +19,7 @@ from .recognize import (
     load_single_template,
     part_sources,
 )
-from .state_machine import detect_frame, expected_marker_scale
+from .state_machine import IDLE_SLOT_MAX_VALUE, detect_frame, expected_marker_scale
 from .stats import DailyStats
 from .strategy import decide_high_or_low, decide_hold, should_continue_highlow
 
@@ -170,35 +171,41 @@ class Bot:
             log("=== 已停止 (F9) ===")
 
     def _check_window_geometry(self) -> None:
-        """檢查視窗長寬比與縮放倍率是否適合目前的校準資料。
+        """依視窗當下的長寬比挑一組校準，並回報縮放倍率是否還夠用。
 
-        座標採用比例式，所以視窗縮放沒問題；但長寬比一改變，遊戲 UI 排版通常也會
-        跟著變動，比例座標就不再對得上，因此這裡會發出警告。
+        座標採用比例式，所以視窗**等比例**縮放沒問題；長寬比一改變，遊戲的排版
+        也會跟著動，所以改成每種比例各存一組校準（見 src/profiles.py），
+        這裡負責挑出對應的那一組。挑不到就借最接近的頂著，並把「這是借的」講清楚。
         """
+        cur_w, cur_h = self.capture.get_client_size()
+        if cur_w <= 0 or cur_h <= 0:
+            return
+
+        selection = profiles_mod.select_for_window(self.cfg, cur_w, cur_h)
+        # 記住這次的比例，_maybe_reselect_profile() 才不會在第一個 tick 又挑一次
+        self._last_aspect = profiles_mod.aspect_of(cur_w, cur_h)
+        log(f"視窗尺寸 {cur_w}x{cur_h}（{profiles_mod.label_for(cur_w, cur_h)}）"
+            f"　{profiles_mod.summarize_selection(selection)}")
+        if not selection.get("matched"):
+            log("[警告] 目前這個長寬比沒有專屬校準，位置會歪。"
+                "請到「校準」分頁按『另存為這個比例的校準』再重新框選一次。")
+
         ref = self.cfg.get("calibration", {})
         ref_w, ref_h = ref.get("client_width", 0), ref.get("client_height", 0)
         if ref_w <= 0 or ref_h <= 0:
-            return  # 舊設定檔沒有記錄校準尺寸，無法比較
+            return  # 沒有記錄校準尺寸，無法比較縮放倍率
 
-        cur_w, cur_h = self.capture.get_client_size()
         delta = aspect_ratio_delta(cur_w, cur_h, ref_w, ref_h)
-        tolerance = self.cfg.get("aspect_ratio_tolerance", 0.02)
         scale = scale_factor(cur_w, ref_w)
-
-        log(f"視窗尺寸 {cur_w}x{cur_h}（校準時 {ref_w}x{ref_h}，縮放 {scale:.2f} 倍）")
-
-        if delta > tolerance:
-            log(
-                f"[警告] 目前長寬比與校準時相差 {delta:.1%}（容許值 {tolerance:.1%}）。"
-                "比例座標只在同一個長寬比下有效，請把視窗調回原本的長寬比，或重新執行 calibrate.py。"
-            )
+        if delta > self.cfg.get("aspect_ratio_tolerance", 0.02):
+            log(f"（這組校準是在 {ref_w}x{ref_h} 量的，長寬比差 {delta:.1%}）")
         if scale < 0.6:
             log(
                 f"[警告] 視窗已縮小到校準時的 {scale:.2f} 倍，卡牌像素變少可能造成辨識率下降；"
                 "若常常認錯牌，可調低 config.json 的 match_threshold 或放大視窗。"
             )
 
-        tmpl_scale = expected_marker_scale(self.cfg, cur_w)
+        tmpl_scale = expected_marker_scale(self.cfg, cur_w, cur_h)
         tmpl_w = self.cfg.get("templates", {}).get("capture_client_width") or 1024
         if abs(tmpl_scale - 1.0) > 0.05:
             log(
@@ -306,12 +313,36 @@ class Bot:
         self.reader = self._build_reader()
         self.ui_templates = self._load_ui_templates(config)
 
+    def _maybe_reselect_profile(self) -> None:
+        """跑到一半改視窗大小也要跟著換校準組。
+
+        只在「長寬比」變了才重挑 —— 等比例縮放本來就不影響比例座標，
+        每次都重挑只會在 log 裡刷一堆沒意義的訊息。
+        """
+        try:
+            cur_w, cur_h = self.capture.get_client_size()
+        except Exception:
+            return
+        if cur_w <= 0 or cur_h <= 0:
+            return
+        aspect = profiles_mod.aspect_of(cur_w, cur_h)
+        previous = getattr(self, "_last_aspect", None)
+        if previous is not None and profiles_mod.relative_delta(aspect, previous) <= 0.01:
+            return
+        self._last_aspect = aspect
+        if previous is None:
+            return  # 啟動時已經由 _check_window_geometry 挑過了
+        selection = profiles_mod.select_for_window(self.cfg, cur_w, cur_h)
+        log(f"[視窗比例改變] {cur_w}x{cur_h}（{profiles_mod.label_for(cur_w, cur_h)}）"
+            f"　{profiles_mod.summarize_selection(selection)}")
+
     def _tick(self) -> None:
         if not self.capture.is_window_valid():
             if not self.capture.locate():
                 log("找不到遊戲視窗，等待中...")
                 return
 
+        self._maybe_reselect_profile()
         frame = detect_frame(self.capture, self.cfg, self.reader, self.ui_templates)
         self._status_ticks += 1
 
@@ -419,7 +450,7 @@ class Bot:
             self._handle_highlow_phase(frame)
             return
 
-        self._handle_idle()
+        self._handle_idle(frame)
 
     # ---------- 各階段處理 ----------
 
@@ -648,7 +679,7 @@ class Bot:
         except (TypeError, ValueError):
             return 0
 
-    def _handle_idle(self) -> None:
+    def _handle_idle(self, frame) -> None:
         """畫面認不出來時才會走到這裡。
 
         剛點完按鈕、遊戲在跑動畫的那一兩秒也是「認不出來」，這時候絕對不能急著
@@ -662,6 +693,25 @@ class Bot:
         if now - self._idle_since < float(self.cfg.get("idle_confirm_sec", 1.5)):
             return
         if not self._should_act("idle"):
+            return
+
+        # 「認不出畫面」不等於「在等你下注」。
+        #
+        # 2026-08-21 的實機 log：比大小畫面上牌認不出來（比大小=-），所有標記都沒過，
+        # 於是一路掉到這裡，每 2.5 秒點一次「投注並開始」，第 4、5、6 次…… 永遠不會結束。
+        # 那顆按鈕在比大小畫面上什麼都不會發生，但也就永遠不會有進展。
+        #
+        # 所以改成**正面確認**：投注畫面的特徵是五個牌位都蓋著深色牌背。
+        # 這個判斷不需要任何樣板，只靠亮度，所以樣板缺失或認不到牌時依然可靠。
+        if not frame.looks_like_betting(
+            float(self.cfg.get("idle_slot_max_value", IDLE_SLOT_MAX_VALUE))
+        ):
+            if self._status_ticks % 12 == 1:
+                shown = frame.slot_values or "（沒量到）"
+                log(f"[待機] 畫面認不出來，但五個牌位的亮度 {shown} 不像投注畫面"
+                    f"（要全部 ≤ {self.cfg.get('idle_slot_max_value', IDLE_SLOT_MAX_VALUE)}），"
+                    "所以不點「投注並開始」。可能是比大小或對話框認不出來 —— "
+                    "看上面的分數哪一項最接近門檻，到「設定」分頁調低那一項。")
             return
 
         self._last_slot_signature = None

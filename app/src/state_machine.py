@@ -4,7 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
-from .recognize import CardReader, marker_score
+from .geometry import content_height
+from .recognize import CardReader, marker_score, median_value
 
 if TYPE_CHECKING:  # 只在型別檢查時需要；執行時不要 import，
     from .capture import GameCapture  # 這樣離線工具不必安裝 mss / pywin32
@@ -35,6 +36,18 @@ DEFAULT_MARKER_PADS = {
 }
 
 
+# 「投注畫面」的判斷門檻：五個牌位的中位亮度都要低於這個值。
+#
+# 實測（三種長寬比、20 幾張實機截圖）：
+#   投注畫面（五張深色牌背）  V = [85, 112, 133, 125, 82]
+#   選牌畫面（五張白牌面）    V = [255, 255, 255, 255, 253]
+#   比大小                    V = [255, 205, 247, 247, 251]
+#   湊牌失敗 / 翻倍對話框     至少四個 >= 205
+# 投注畫面最亮的是 133，其他畫面最暗的（不算被立繪蓋住的那一格）是 205，
+# 中間空一大段，170 放在中間非常安全。
+IDLE_SLOT_MAX_VALUE = 170
+
+
 @dataclass
 class FrameInfo:
     on_table: bool
@@ -49,6 +62,20 @@ class FrameInfo:
     is_max_win: bool = False
     ui_scores: dict = field(default_factory=dict)
 
+    # 五個牌位的中位亮度。用來確認「這真的是投注畫面」再去點投注並開始，
+    # 空 list 代表沒量到（校準框無效或擷取失敗），此時視為無法確認。
+    slot_values: list = field(default_factory=list)
+
+    def looks_like_betting(self, max_value: float = IDLE_SLOT_MAX_VALUE) -> bool:
+        """五個牌位是否都是「蓋著的深色牌背」= 這是等你下注的畫面。
+
+        必須**五個都**成立。翻倍對話框的第一格會被立繪蓋住而變暗（V=88），
+        只要求「大部分很暗」就會把對話框誤判成投注畫面。
+        """
+        if len(self.slot_values) < 5:
+            return False
+        return all(v <= max_value for v in self.slot_values)
+
     @property
     def any_dialog(self) -> bool:
         """任何一個對話框畫面成立時為 True。
@@ -60,23 +87,47 @@ class FrameInfo:
                 or self.is_poker_fail or self.is_max_win)
 
 
-def expected_marker_scale(cfg: dict, client_width: int) -> float:
-    """目前視窗寬 ÷ 擷取畫面標記樣板當時的視窗寬。
+def expected_marker_scale(cfg: dict, client_width: int,
+                          client_height: int = 0) -> float:
+    """畫面標記樣板要放大／縮小幾倍才對得上目前的畫面。
 
-    畫面標記樣板是校準當下從畫面切下來的點陣圖，帶著當時的解析度。
-    內建的預設樣板 (defaults/ui/) 是從 1024×438 的截圖切出來的，
-    如果實機視窗是 1937×817，樣板要放大 1.89 倍才對得起來。
+    樣板是校準當下從畫面切下來的點陣圖，帶著當時的解析度。內建預設樣板
+    (defaults/ui/) 來自 1024×438 的截圖。
+
+    **倍率取決於「內容框的高度」，不是視窗寬度。** 遊戲把一個 16:9 的內容框
+    置中放進視窗，UI 全部排在裡面（詳見 geometry.content_box）。實測：
+
+        畫面              實測倍率   內容框高度比   舊的視窗寬度比
+        16:9 1474x829      1.894       1.893          1.439  ← 差 24%
+        4:3  1269x952      1.632       1.630          1.239  ← 差 24%
+        21:9 1367x574      1.308       1.311          1.335  ← 差 2%
+
+    舊公式只在接近 21:9 時剛好差不多，所以一直沒被發現；一換成 16:9 或 4:3
+    就用錯 24% 的倍率去比對，所有畫面標記的分數整排掉下來。
+
+    拿不到視窗高度時退回舊公式 —— 不準，但比回傳 1.0 好。
     """
     tmpl_cfg = cfg.get("templates", {}) or {}
-    try:
-        ref_w = int(tmpl_cfg.get("capture_client_width") or 0)
-    except (TypeError, ValueError):
-        ref_w = 0
-    if ref_w <= 0:
-        ref_w = 1024  # 內建預設樣板的來源解析度
+
+    def _int(key: str, fallback: int) -> int:
+        try:
+            value = int(tmpl_cfg.get(key) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        return value if value > 0 else fallback
+
+    ref_w = _int("capture_client_width", 1024)   # 內建預設樣板的來源解析度
+    ref_h = _int("capture_client_height", 438)
+
     if client_width <= 0:
         return 1.0
-    return client_width / float(ref_w)
+    if client_height <= 0:
+        return client_width / float(ref_w)
+
+    ref_box = content_height(ref_w, ref_h)
+    if ref_box <= 0:
+        return client_width / float(ref_w)
+    return content_height(client_width, client_height) / ref_box
 
 
 def _expand_region(region: dict, pad_x: float = 0.25, pad_y: float = 0.5) -> dict:
@@ -154,10 +205,10 @@ def detect_frame(
     )
 
     try:
-        client_w, _client_h = capture.get_client_size()
+        client_w, client_h = capture.get_client_size()
     except Exception:
-        client_w = 0
-    scale = expected_marker_scale(cfg, client_w)
+        client_w = client_h = 0
+    scale = expected_marker_scale(cfg, client_w, client_h)
 
     thresholds = dict(DEFAULT_MARKER_THRESHOLDS)
     thresholds.update(cfg.get("marker_thresholds", {}) or {})
@@ -193,6 +244,7 @@ def detect_frame(
     on_table = True if table_score < 0 else hit("table_marker")
 
     slot_cards = []
+    slot_values: list[int] = []
     for slot_region in regions["card_slots"]:
         if slot_region.get("w", 0) <= 0:
             slot_cards.append(None)
@@ -202,6 +254,7 @@ def detect_frame(
         except Exception:
             slot_cards.append(None)
             continue
+        slot_values.append(median_value(roi))
         h, w = roi.shape[:2]
         slot_cards.append(reader.read(roi, w, h))
 
@@ -227,6 +280,7 @@ def detect_frame(
         is_fail=hit("fail_marker"),
         is_poker_fail=hit("poker_fail_marker"),
         is_max_win=hit("max_win_marker"),
+        slot_values=slot_values,
         ui_scores={
             "table": table_score,
             "draw": scores["draw_prompt"],

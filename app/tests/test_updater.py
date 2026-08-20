@@ -50,6 +50,16 @@ class TestVersionCompare(unittest.TestCase):
         for junk in ("", "latest", "v", "release-2026", None):
             self.assertFalse(ver.is_newer(junk, "1.0.0"), junk)
 
+    def test_none_candidate_does_not_fall_back_to_the_current_version(self):
+        """`is_newer(None)` 絕對不能變成「拿自己跟舊版比」。
+
+        `version_tuple()` 的預設值是目前程式版本，所以少了 None 的守衛，
+        `is_newer(None, "1.0.0")` 在 __version__ 一旦超過 1.0.0 之後
+        就會回報「有更新」—— 憑空冒出一個不存在的新版本。
+        """
+        self.assertFalse(ver.is_newer(None, "0.0.1"))
+        self.assertFalse(ver.is_newer("", "0.0.1"))
+
 
 class TestReleaseParsing(unittest.TestCase):
     def _release(self, **kwargs) -> dict:

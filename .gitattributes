@@ -1,0 +1,17 @@
+# 換行處理。
+#
+# 預設讓 Git 自己判斷文字檔（提交時存成 LF，取出時依平台轉換），
+# 只有批次檔強制 CRLF —— cmd 對只有 LF 的 .bat 在某些情況下（尤其是
+# goto / 標籤）會解析出奇怪的結果，而更新流程整個靠一支 .bat 撐著，
+# 不值得為了統一而冒這個險。
+* text=auto
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二進位檔不要做任何轉換
+*.png binary
+*.ico binary
+*.zip binary
+*.exe binary

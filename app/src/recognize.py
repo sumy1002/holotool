@@ -386,3 +386,16 @@ def find_rightmost_card(
     if len(near) > 1 and (best_score - near[1][2]) < min_margin:
         return None  # 同一個位置有兩張牌分數太接近，不敢採信
     return best_label, best_score, best_x
+
+
+def median_value(image: "np.ndarray") -> int:
+    """回傳一塊畫面的「中位亮度」(HSV 的 V，0~255)。
+
+    用來區分「蓋著的深色牌背」與「白色牌面／淺色面板」，判斷目前是不是
+    等你下注的投注畫面。取中位數而不是平均：牌面上的黑色花色圖案、牌背上的
+    亮色邊框都是少數像素，中位數不會被它們拉走。
+    """
+    if image is None or getattr(image, "size", 0) == 0:
+        return -1
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    return int(np.median(hsv[:, :, 2]))
