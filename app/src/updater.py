@@ -45,6 +45,7 @@ from .version import (
     __version__,
     asset_name,
     is_newer,
+    parse_patch_asset_name,
     release_api_url,
     releases_page_url,
 )
@@ -84,6 +85,23 @@ class ReleaseInfo:
     size: int               # 位元組；GitHub 沒給就是 0
     sha256: str = ""        # 期望的雜湊值；抓不到就是空字串
     page_url: str = ""      # 給人看的頁面
+
+    # 差分包（只含「跟某一版不同的檔案」）。沒有可用的差分包時全部是空的。
+    # `patch_base` 一定等於目前安裝的版本，否則不會被選中 —— 見 `_pick_patch()`。
+    patch_url: str = ""
+    patch_name: str = ""
+    patch_size: int = 0
+    patch_sha256: str = ""
+    patch_base: str = ""
+
+    @property
+    def has_patch(self) -> bool:
+        return bool(self.patch_url and self.patch_base)
+
+    @property
+    def download_size(self) -> int:
+        """實際會下載多少 —— 有差分包就是差分包的大小。"""
+        return self.patch_size if self.has_patch else self.size
 
 
 @dataclass
@@ -160,7 +178,13 @@ def _parse_release(data: dict) -> ReleaseInfo:
     version = tag[1:] if tag[:1].lower() == "v" else tag
 
     assets = [a for a in (data.get("assets") or []) if isinstance(a, dict)]
-    zips = [a for a in assets if str(a.get("name", "")).lower().endswith(".zip")]
+    all_zips = [a for a in assets if str(a.get("name", "")).lower().endswith(".zip")]
+    # 差分包也叫 HoloTool-*.zip，**一定要先剔掉**，否則下面那條
+    # 「開頭是 holotool- 的第一個 zip」的退路會挑到差分包當成整包，
+    # 解開之後最上層沒有 HoloTool.exe 就整個放棄，而且訊息會很難懂。
+    patches = [a for a in all_zips
+               if parse_patch_asset_name(str(a.get("name", ""))) is not None]
+    zips = [a for a in all_zips if a not in patches]
     wanted = asset_name(version).lower()
 
     chosen = None
@@ -185,7 +209,7 @@ def _parse_release(data: dict) -> ReleaseInfo:
     notes = str(data.get("body") or "").strip()
     sha = _fetch_sha_asset(assets, zip_name) or _sha256_from_notes(notes)
 
-    return ReleaseInfo(
+    info = ReleaseInfo(
         version=version,
         tag=tag,
         notes=notes,
@@ -195,6 +219,35 @@ def _parse_release(data: dict) -> ReleaseInfo:
         sha256=sha,
         page_url=str(data.get("html_url") or releases_page_url()),
     )
+    _attach_patch(info, patches, assets, notes)
+    return info
+
+
+def _attach_patch(info: "ReleaseInfo", patches: list, assets: list, notes: str,
+                  installed: str | None = None) -> None:
+    """挑一個「基底版本正好是目前安裝版本」的差分包掛上去。
+
+    判斷完全靠檔名（`HoloTool-<新版>-patch-from-<舊版>.zip`），所以**還沒下載
+    任何東西**就能決定用不用得上 —— 這正是差分更新要省的那 76 MB。
+
+    對不上就什麼都不做：`prepare_update()` 會照舊抓整包。跨好幾版的人、
+    或發版時忘記上傳差分包的情況，都會自動落到這條安全的路上。
+    """
+    current = installed or __version__
+    for asset in patches:
+        name = str(asset.get("name") or "")
+        parsed = parse_patch_asset_name(name)
+        if parsed is None:
+            continue
+        patch_version, base = parsed
+        if base != current or patch_version != info.version:
+            continue
+        info.patch_url = str(asset.get("browser_download_url") or "")
+        info.patch_name = name
+        info.patch_size = int(asset.get("size") or 0)
+        info.patch_base = base
+        info.patch_sha256 = _fetch_sha_asset(assets, name)
+        return
 
 
 def _fetch_sha_asset(assets: list, zip_name: str) -> str:
@@ -267,22 +320,25 @@ def sha256_of(path: str, chunk: int = 1 << 20) -> str:
 
 
 def download_release(release: ReleaseInfo, dest_dir: str,
-                     progress=None, timeout: float = 60.0) -> str:
+                     progress=None, timeout: float = 60.0,
+                     use_patch: bool = False) -> str:
     """把更新包下載到 `dest_dir`，回傳實際存檔路徑。
 
     `progress(已下載位元組, 總位元組或 0)` 會被呼叫多次，給 GUI 顯示進度用。
     下載中途失敗會把半成品刪掉，不留下會被誤認成完整檔的殘骸。
     """
-    if not release.zip_url:
+    url = release.patch_url if (use_patch and release.has_patch) else release.zip_url
+    name = release.patch_name if (use_patch and release.has_patch) else release.zip_name
+    hinted = release.patch_size if (use_patch and release.has_patch) else release.size
+    if not url:
         raise UpdateError("這個 Release 沒有可下載的網址。")
     os.makedirs(dest_dir, exist_ok=True)
-    dest = os.path.join(dest_dir, os.path.basename(release.zip_name))
-    request = urllib.request.Request(release.zip_url,
-                                     headers={"User-Agent": USER_AGENT})
+    dest = os.path.join(dest_dir, os.path.basename(name))
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     done = 0
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            total = int(response.headers.get("Content-Length") or release.size or 0)
+            total = int(response.headers.get("Content-Length") or hinted or 0)
             with open(dest, "wb") as f:
                 while True:
                     block = response.read(1 << 18)
@@ -412,8 +468,17 @@ def staging_root() -> str:
     return os.path.join(tempfile.gettempdir(), "HoloTool-update")
 
 
-def extract_update(zip_path: str, staging: str | None = None) -> str:
+PATCH_MARKER = "patch.json"
+
+
+def extract_update(zip_path: str, staging: str | None = None,
+                   expect_patch_from: str = "") -> str:
     """把更新包解到暫存區，回傳暫存區路徑。
+
+    `expect_patch_from` 有值時代表這是**差分包**：最上層不會有完整的
+    `HoloTool.exe`（只有真的變動過的檔案），改成要求 `patch.json` 存在
+    而且裡面的 `base` 正好等於目前安裝的版本 —— 拿錯基底版本的差分包蓋上去
+    會生出一個混版的安裝，比不更新還糟。
 
     解壓時會擋掉三種東西：
       · 絕對路徑與 `..`（zip 路徑穿越攻擊）
@@ -445,7 +510,9 @@ def extract_update(zip_path: str, staging: str | None = None) -> str:
             with zf.open(info) as src, open(dest, "wb") as out:
                 shutil.copyfileobj(src, out)
 
-    if not os.path.exists(os.path.join(target, SENTINEL)):
+    if expect_patch_from:
+        _verify_patch_marker(target, expect_patch_from)
+    elif not os.path.exists(os.path.join(target, SENTINEL)):
         shutil.rmtree(target, ignore_errors=True)
         raise UpdateError(
             f"更新包解開後最上層沒有 {SENTINEL}，結構不對，已放棄這次更新。"
@@ -454,6 +521,28 @@ def extract_update(zip_path: str, staging: str | None = None) -> str:
         _log(f"[更新] 解壓時略過 {len(skipped)} 個不該出現的項目："
              f"{', '.join(skipped[:5])}{' ...' if len(skipped) > 5 else ''}")
     return target
+
+
+def _verify_patch_marker(target: str, expected_base: str) -> None:
+    """差分包解開後一定要有 `patch.json`，而且基底版本要對得上。"""
+    path = os.path.join(target, PATCH_MARKER)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            info = json.load(f)
+        base = str(info.get("base") or "")
+    except (OSError, ValueError) as exc:
+        shutil.rmtree(target, ignore_errors=True)
+        raise UpdateError(
+            f"差分更新包裡沒有可讀的 {PATCH_MARKER}，已放棄（會改用完整更新包）。"
+        ) from exc
+    if base != expected_base:
+        shutil.rmtree(target, ignore_errors=True)
+        raise UpdateError(
+            f"差分更新包是要從 {base} 升上來的，但目前安裝的是 {expected_base}，"
+            "套上去會變成混版，已放棄（會改用完整更新包）。"
+        )
+    # 這個檔案只是標記，不要跟著複製進安裝目錄
+    _silent_remove(path)
 
 
 def _is_protected(archive_name: str) -> bool:
@@ -765,15 +854,35 @@ def prepare_update(release: ReleaseInfo, progress=None) -> dict:
         if progress:
             progress(text)
 
-    _say("正在下載更新包…")
-    zip_path = download_release(
-        release, parent,
-        progress=lambda done, total: _say(_progress_text(done, total)),
-    )
+    def _report(done, total):
+        _say(_progress_text(done, total))
 
-    _say("正在驗證檔案完整性…")
-    verify_download(zip_path, release.sha256)
-    if not release.sha256:
+    used_patch = False
+    zip_path = ""
+    if release.has_patch:
+        # 差分包只含「跟目前這一版不同的檔案」。整包 76 MB 裡有 99.9% 是
+        # numpy / opencv / tcl-tk / python3xx.dll 這些一個位元組都沒動的東西。
+        saved = release.size - release.patch_size
+        _say(f"正在下載差分更新包（{release.patch_size / 1048576:.1f} MB，"
+             f"省下 {max(0, saved) / 1048576:.0f} MB）…")
+        try:
+            zip_path = download_release(release, parent, progress=_report,
+                                        use_patch=True)
+            verify_download(zip_path, release.patch_sha256)
+            used_patch = True
+        except UpdateError as exc:
+            # 差分這條路只要有任何一點不對勁就整條放棄，改抓整包。
+            # 寧可多下載 70 MB，也不要把一個來路不明的差分包蓋到安裝目錄上。
+            _log(f"[更新] 差分更新包不能用（{exc}），改用完整更新包。")
+            _silent_remove(zip_path)
+            zip_path = ""
+
+    if not zip_path:
+        _say("正在下載更新包…")
+        zip_path = download_release(release, parent, progress=_report)
+        _say("正在驗證檔案完整性…")
+        verify_download(zip_path, release.sha256)
+    if not (release.patch_sha256 if used_patch else release.sha256):
         _log("[更新] 這個 Release 沒有附 .sha256，只驗證了 zip 結構完整性。")
 
     _say("正在備份你的校準與樣板…")
@@ -784,13 +893,32 @@ def prepare_update(release: ReleaseInfo, progress=None) -> dict:
         _log("[更新] 沒有找到可備份的 config/card_templates（全新安裝？）")
 
     _say("正在解開更新包…")
-    staging = extract_update(zip_path, work)
+    try:
+        staging = extract_update(
+            zip_path, work,
+            expect_patch_from=release.patch_base if used_patch else "")
+    except UpdateError as exc:
+        if not used_patch:
+            raise
+        # 解開之後才發現差分包不對（基底版本錯、缺 patch.json）——
+        # 此時安裝目錄還一個位元組都沒被動到，直接改抓整包重來。
+        _log(f"[更新] 差分更新包解開後不合格（{exc}），改用完整更新包。")
+        _silent_remove(zip_path)
+        used_patch = False
+        _say("正在下載完整更新包…")
+        zip_path = download_release(release, parent, progress=_report)
+        verify_download(zip_path, release.sha256)
+        staging = extract_update(zip_path, work)
+
+    kind = "差分" if used_patch else "完整"
+    _log(f"[更新] 使用{kind}更新包：{os.path.basename(zip_path)}"
+         f"（{os.path.getsize(zip_path) / 1048576:.1f} MB）")
 
     script = write_apply_script(staging, root, zip_path=zip_path,
                                 pid=os.getpid(), script_dir=parent)
     _say("準備完成，可以重新啟動了。")
     return {"script": script, "staging": staging, "zip": zip_path,
-            "backup": backup, "root": root}
+            "backup": backup, "root": root, "patch": used_patch}
 
 
 def _progress_text(done: int, total: int) -> str:

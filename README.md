@@ -511,6 +511,32 @@ app\dist\HoloTool-1.0.1.zip.sha256
 第一次安裝的人要的是安裝檔，加 `--installer` 會順便產生
 `HoloToolSetup.exe`，可以一起放上 Release。
 
+### 差分更新包：76 MB → 約 8 MB
+
+`HoloTool-1.0.19.zip` 是 **76.5 MB**，但 1.0.13→1.0.19 六個版本的 zip 大小
+**總共只差 54 KB** —— 每次更新有 99.9% 在重抓一模一樣的 numpy / opencv /
+tcl-tk / `python3xx.dll`。真正會變的只有 `HoloTool.exe`（裡面包著程式碼）
+與 `base_library.zip`。
+
+（順帶一提，`git clone` 整個 repo 只有 909 KB、1.3 秒 —— 覺得「拉更新很慢」
+的時候，慢的一定是 Release 資產那 76 MB，不是 git。）
+
+所以 `make_release.py` 每次會多產一個
+`HoloTool-<ver>-patch-from-<舊版>.zip`（連同 `.sha256`），發版時**跟整包一起
+上傳**。基準線就是 `app\dist\` 裡上一版的整包 zip —— 不需要另外維護清單檔，
+比對用 zip 中央目錄現成的 CRC32 + 大小，讀一個 76 MB 的包只要幾毫秒。
+
+updater 光看檔名就知道差分包用不用得上（`-patch-from-<舊版>` 要正好等於
+目前安裝的版本），所以**不必先下載任何 metadata**。對不上（跨了好幾版、
+或發版時忘了上傳）就安靜地改抓整包。
+
+安全性有兩道關卡：選的時候比檔名，解開之後再比一次 `patch.json` 裡的 `base`。
+任何一關不過就整條放棄改抓整包 —— 而放棄的時候安裝目錄一個位元組都還沒被動到。
+差分包大於整包的 60% 時（例如真的升級了 opencv）就不產，只出整包。
+
+> **刪除的檔案表達不出來。** 置換用的 `robocopy` 本來就沒有 `/PURGE`，
+> 整包更新也不會刪任何東西，所以兩邊行為一致。真的要移除舊檔只能請使用者重裝。
+
 ### 更新絕對不會動到的東西
 
 `config\`、`card_templates\`（含 `parts\`）、`data\`、`logs\`、`debug_captures\`。

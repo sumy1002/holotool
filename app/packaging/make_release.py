@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -47,8 +48,15 @@ BUNDLE_DIR = os.path.join(DIST, "HoloTool")
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from src.updater import PROTECTED_DIRS, SENTINEL          # noqa: E402
-from src.version import __version__, asset_name, TAG_PREFIX  # noqa: E402
+from src.updater import PATCH_MARKER, PROTECTED_DIRS, SENTINEL   # noqa: E402
+from src.version import parse_patch_asset_name                   # noqa: E402
+from src.version import (                                        # noqa: E402
+    __version__,
+    asset_name,
+    patch_asset_name,
+    version_tuple,
+    TAG_PREFIX,
+)
 
 # 這些資料夾（不管出現在第幾層）一律不進更新包
 EXCLUDE_DIRS = {p.lower() for p in PROTECTED_DIRS} | {"backups", "__pycache__"}
@@ -140,6 +148,101 @@ def _assert_no_user_data(zip_path: str) -> None:
     print("自我檢查通過：更新包裡沒有任何 config / card_templates / data / logs 檔案。")
 
 
+
+# --------------------------------------------------------------- 差分更新包
+
+# 差分包大於整包的這個比例時就不要產了。
+#
+# 差分的意義是「別再重抓那 70 MB 一模一樣的相依套件」。萬一某一版真的動到
+# opencv / numpy（升級套件、換 Python 版本），差分包會跟整包差不多大，
+# 那時候多上傳一個檔只是多佔空間、也多一條會出錯的路。
+PATCH_MAX_RATIO = 0.6
+
+
+def _zip_fingerprints(path: str) -> dict:
+    """讀 zip 的中央目錄，回傳 {內部路徑: (CRC32, 原始大小)}。
+
+    **不解壓、不算 SHA256。** CRC32 + 大小是 zip 本來就存好的，讀一個 76 MB
+    的更新包只要幾毫秒。這裡要回答的問題是「我自己這兩次打包，這個檔一不一樣」，
+    不是防篡改 —— 整包的 SHA256 另外算，那個才是給使用者驗的。
+    """
+    out = {}
+    with zipfile.ZipFile(path) as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            out[info.filename.replace("\\", "/")] = (info.CRC, info.file_size)
+    return out
+
+
+def _previous_release_zip(out_dir: str, version: str):
+    """找版本比現在小、而且最大的那個整包 zip。回傳 (版本, 路徑)。
+
+    **基準線就是上一版的整包本身**，不需要另外維護一份清單檔 ——
+    少一個「不要刪這個檔」的坑，而且對已經發出去的舊版也能回溯生效。
+    """
+    best = None
+    for name in os.listdir(out_dir):
+        if not (name.startswith("HoloTool-") and name.endswith(".zip")):
+            continue
+        if parse_patch_asset_name(name) is not None:      # 差分包不是基準線
+            continue
+        other = name[len("HoloTool-"):-len(".zip")]
+        if version_tuple(other) >= version_tuple(version):
+            continue
+        if best is None or version_tuple(other) > version_tuple(best[0]):
+            best = (other, os.path.join(out_dir, name))
+    return best
+
+
+def build_patch_zip(out_dir: str, version: str, full_zip: str):
+    """只把「跟上一版不同的檔案」壓成一包。沒有上一版或不划算時回傳 None。
+
+    **刪除的檔案表達不出來** —— 置換用的 robocopy 本來就沒有 /PURGE，
+    整包更新也不會刪任何東西，所以兩邊行為一致，不算新的缺口。
+    """
+    previous = _previous_release_zip(out_dir, version)
+    if previous is None:
+        print("\n（`app\\dist\\` 裡沒有更早的整包 zip，這一版只出整包；"
+              "下一版起就有基準可以做差分了）")
+        return None
+    base, base_zip = previous
+    old = _zip_fingerprints(base_zip)
+    new = _zip_fingerprints(full_zip)
+    changed = sorted(name for name, fp in new.items() if old.get(name) != fp)
+    if not changed:
+        print(f"\n（跟 {base} 相比一個檔案都沒變，不產差分包）")
+        return None
+
+    zip_path = os.path.join(out_dir, patch_asset_name(version, base))
+    if os.path.exists(zip_path):
+        os.remove(zip_path)
+    with zipfile.ZipFile(full_zip) as src, \
+            zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        for name in changed:
+            zf.writestr(name, src.read(name))
+        zf.writestr(PATCH_MARKER, json.dumps(
+            {"version": version, "base": base}, ensure_ascii=False))
+
+    full_size = os.path.getsize(full_zip)
+    size = os.path.getsize(zip_path)
+    if full_size and size > full_size * PATCH_MAX_RATIO:
+        os.remove(zip_path)
+        print(f"\n（跟 {base} 相比變動太多：差分 {size / 1048576:.1f} MB vs "
+              f"整包 {full_size / 1048576:.1f} MB，不划算，這一版只出整包）")
+        return None
+
+    _assert_no_user_data(zip_path)
+    saved = f"，省下 {100 - size * 100 / full_size:.0f}%" if full_size else ""
+    print(f"\n差分更新包（從 {base} 升上來）：{len(changed)} 個檔案有變動，"
+          f"{size / 1048576:.1f} MB —— 整包是 {full_size / 1048576:.1f} MB{saved}")
+    for name in changed[:12]:
+        print(f"    {name}")
+    if len(changed) > 12:
+        print(f"    …（還有 {len(changed) - 12} 個）")
+    return zip_path
+
+
 def write_sha256(zip_path: str) -> str:
     digest = hashlib.sha256()
     with open(zip_path, "rb") as f:
@@ -179,6 +282,9 @@ def main() -> None:
     sha = write_sha256(zip_path)
     size_mb = os.path.getsize(zip_path) / (1024 * 1024)
 
+    patch_path = build_patch_zip(args.out, version, zip_path)
+    patch_sha = write_sha256(patch_path) if patch_path else ""
+
     setup = ""
     if args.installer:
         _run([python, os.path.join(HERE, "build_installer.py"),
@@ -190,6 +296,10 @@ def main() -> None:
     print(f"更新包已產生：{zip_path}   ({size_mb:.1f} MB)")
     print(f"SHA256      ：{sha}")
     print(f"雜湊檔      ：{zip_path}.sha256")
+    if patch_path:
+        print(f"差分更新包  ：{patch_path}   "
+              f"({os.path.getsize(patch_path) / (1024 * 1024):.1f} MB)")
+        print(f"差分 SHA256 ：{patch_sha}")
     if setup:
         print(f"安裝檔      ：{setup}")
     print()
@@ -197,9 +307,13 @@ def main() -> None:
     print("  1. 進 repo → 右邊 Releases → Draft a new release")
     print(f"  2. Choose a tag → 輸入 {tag} → Create new tag on publish")
     print(f"  3. Release title 填 {tag}，說明寫這一版改了什麼")
-    print("  4. 把下面這兩個檔案拖進 Attach binaries 區塊：")
+    print("  4. 把下面這些檔案拖進 Attach binaries 區塊：")
     print(f"       {os.path.basename(zip_path)}")
     print(f"       {os.path.basename(zip_path)}.sha256")
+    if patch_path:
+        print(f"       {os.path.basename(patch_path)}          ← 差分包，"
+              "上一版的人只會下載這個")
+        print(f"       {os.path.basename(patch_path)}.sha256")
     if setup:
         print(f"     （想讓新人直接下載安裝檔，也可以一起拖 {os.path.basename(setup)}）")
     print("  5. 想先自己試裝就勾 Set as a pre-release —— 勾了之後")

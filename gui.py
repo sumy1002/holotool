@@ -2306,10 +2306,22 @@ class HoloToolGUI(tk.Tk):
         notes = (release.notes or "（這一版沒有寫說明）").strip()
         if len(notes) > 1000:
             notes = notes[:1000] + "\n…"
+        # 有差分包時實際只會下載那一包（整包 76 MB 裡有 99.9% 是一模一樣的
+        # numpy / opencv / tcl-tk）。這裡一定要把「真正會下載多少」講出來 ——
+        # 顯示 76 MB 卻只下載 8 MB，使用者會以為壞了。
+        size_mb = release.download_size / (1024 * 1024)
+        if release.has_patch:
+            size_line = (f"下載大小：{size_mb:.1f} MB"
+                         f"（差分更新，整包是 {release.size / (1024 * 1024):.0f} MB）\n\n")
+        elif release.size:
+            size_line = f"下載大小：{size_mb:.1f} MB\n\n"
+        else:
+            size_line = ""
         proceed = messagebox.askyesno(
             f"發現新版本 v{release.version}",
             f"目前版本：v{result.current}\n"
             f"最新版本：v{release.version}\n\n"
+            f"{size_line}"
             f"{notes}\n\n"
             "── 這次更新會動到什麼 ──\n"
             "只覆蓋程式檔案（HoloTool.exe 與 app\\ 裡的程式內容）。\n"

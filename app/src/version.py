@@ -26,7 +26,7 @@
 """
 from __future__ import annotations
 
-__version__ = "1.0.20"
+__version__ = "1.0.22"
 
 # ---------------------------------------------------------------- GitHub
 
@@ -60,6 +60,39 @@ def asset_name(version: str | None = None) -> str:
     改命名規則只要改這一個函式。
     """
     return f"HoloTool-{version or __version__}.zip"
+
+
+# ------------------------------------------------------- 差分（patch）更新包
+
+# 整包更新是 76 MB，但連續兩個版本之間真正變動的只有幾 MB
+# （HoloTool.exe 裡包著程式碼、base_library.zip，其餘 numpy / opencv /
+# tcl-tk / python3xx.dll 一個位元組都沒動）。實測 1.0.13~1.0.19 六個版本，
+# zip 大小總共只差 54 KB —— 也就是每次更新有 99.9% 在重抓一模一樣的東西。
+#
+# 所以每次發版**多產一個只含變動檔案的 patch zip**，檔名把「從哪一版升上來」
+# 寫進去，updater 光看檔名就知道能不能用，不必先下載任何東西。
+PATCH_INFIX = "-patch-from-"
+
+
+def patch_asset_name(version: str, base: str) -> str:
+    """差分包檔名，例如 `HoloTool-1.0.21-patch-from-1.0.20.zip`。"""
+    return f"HoloTool-{version}{PATCH_INFIX}{base}.zip"
+
+
+def parse_patch_asset_name(name: str):
+    """`HoloTool-1.0.21-patch-from-1.0.20.zip` → `("1.0.21", "1.0.20")`。
+
+    不是差分包就回 None。刻意用檔名承載這個資訊：updater 在**還沒下載任何
+    東西**的時候就要能判斷「這個差分包我用不用得上」。
+    """
+    base_name = name[:-4] if name.lower().endswith(".zip") else name
+    if not base_name.lower().startswith("holotool-") or PATCH_INFIX not in base_name:
+        return None
+    head, _, base = base_name.partition(PATCH_INFIX)
+    version = head[len("holotool-"):]
+    if not version or not base:
+        return None
+    return version, base
 
 
 # ------------------------------------------------------------ 版本比較
