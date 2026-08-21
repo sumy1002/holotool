@@ -85,10 +85,12 @@ from src.geometry import (
 )
 from src.handeval import Card, normalize_label_input
 from src.overlay import CalibrationPreview, select_point, select_region
+from src import cardparts
 from src.cardparts import (
     MIN_OWN_TO_DROP_BUNDLED,
     bundled_copies_present,
     extract_parts,
+    joker_template_count,
     missing_parts,
     next_part_path,
     parse_part_name,
@@ -624,6 +626,9 @@ class HoloToolGUI(tk.Tk):
                  "確認無誤就按「全部儲存」，猜錯的自己改掉再存。玩一兩局就能湊齊。"
                  "代號格式：點數 + 花色，例如 10H、AS、QD。"
                  "花色 S=黑桃 H=紅心 D=方塊 C=梅花；不要的那格清空即可。"
+                 "鬼牌（中間印著 JOKER 那張）代號填 JK —— 它沒有花色，"
+                 "只會存左上角那個「$」當點數樣板，但一定要抓，"
+                 "否則抽到鬼牌那一格永遠認不出來、選牌畫面卡在 4/5。"
                  "代號欄只吃英數字（大小寫都一樣），並且關掉了輸入法，不必再切中英文。",
             foreground="#555",
             justify="left",
@@ -1679,14 +1684,30 @@ class HoloToolGUI(tk.Tk):
             label = slot["var"].get().strip().upper()
             if parts is None or not label:
                 continue
-            if label == "JK":
-                skipped.append("JK（鬼牌沒有點數/花色，不用蒐集）")
-                continue
             try:
-                Card.from_label(label)
+                card = Card.from_label(label)
             except ValueError:
                 skipped.append(f"{label}（格式不對）")
                 continue
+
+            # 鬼牌：**要蒐集**，而且只蒐集點數那一格。
+            #
+            # 這裡本來寫著「鬼牌沒有點數/花色，不用蒐集」直接跳過 —— 那句話是錯的，
+            # 而且代價很大：鬼牌左上角印的是一個「$」，對 13 個點數的分數全部落在
+            # 0.6 上下（實機 log：`點數 8=0.64 2=0.62 ←分數未達 0.72`），
+            # 於是那一格永遠認不出來，選牌畫面永遠只有 4/5，bot 就整晚停在那裡。
+            # 版面跟普通牌完全一樣（右下角也印一次、轉 180 度），所以只要把 JK
+            # 當成第 14 個點數標籤存起來就好。
+            # 花色與中央大圖案不存：鬼牌沒有花色，中央那隻怪物存進 pip 只會去
+            # 干擾黑桃/梅花的判斷。
+            if card.rank == cardparts.JOKER_RANK:
+                saved += self._write_part("rank", cardparts.JOKER_RANK,
+                                          parts["rank"], written)
+                if parts.get("rank2") is not None:
+                    saved += self._write_part("rank", cardparts.JOKER_RANK,
+                                              parts["rank2"], written)
+                continue
+
             rank, suit = label[:-1], label[-1]
             if parts["is_red"] != (suit in "HD"):
                 skipped.append(f"{label}（顏色對不上：畫面上是{'紅' if parts['is_red'] else '黑'}色）")
@@ -1845,14 +1866,23 @@ class HoloToolGUI(tk.Tk):
         n_rank = len(templates.get("rank") or {})
         n_suit = len(templates.get("suit") or {})
         n_pip = len(templates.get("pip") or {})
+        n_joker = joker_template_count(templates)
+        # 鬼牌另外算：它不在 13 個點數裡，但沒有它的話抽到鬼牌就整個卡住，
+        # 所以要單獨顯示，不能被「點數 13/13 ✓」蓋掉。
         self.tmpl_progress.config(
-            text=f"點數 {n_rank}/13　花色 {n_suit}/4　中央大圖案 {n_pip}/4")
+            text=f"點數 {n_rank - (1 if n_joker else 0)}/13　花色 {n_suit}/4　"
+                 f"中央大圖案 {n_pip}/4　鬼牌 {'✓' if n_joker else '✗'}（{n_joker} 張）")
 
         lines = []
         if miss_rank:
             lines.append("還缺點數：" + "  ".join(miss_rank))
         if miss_suit:
             lines.append("還缺花色：" + "  ".join(miss_suit))
+        if not n_joker:
+            lines.append("⚠ 還沒有鬼牌（JK）樣板 —— 抽到鬼牌時那一格會永遠認不出來，"
+                         "選牌畫面只有 4/5，bot 會停在那裡。")
+            lines.append("　→ 下次畫面上出現鬼牌時按「讀取目前畫面」，那一格代號填 "
+                         "JK 再儲存即可（鬼牌沒有花色，只會存點數那一格）。")
 
         # 每個標籤實際的樣板數量。以前這裡只顯示「有沒有自己的樣板」，
         # 於是「有 3 個檔案但 2 個是裁壞的小點、真正拿來比對只有 1 張」
@@ -1862,6 +1892,10 @@ class HoloToolGUI(tk.Tk):
         for kind, title in (("rank", "點數"), ("suit", "花色"), ("pip", "中央大圖案")):
             for key in sorted(inventory.get(kind, {}), key=lambda k: (len(k), k)):
                 row = inventory[kind][key]
+                # 鬼牌不進這一列：這一列講的是「還在跟內建糊圖混著比對」，
+                # 而內建樣板裡從來就沒有鬼牌，寫進去只會給錯的說明。
+                if key == cardparts.JOKER_RANK:
+                    continue
                 if row["own"] < MIN_OWN_TO_DROP_BUNDLED:
                     thin.append(f"{title}{key}({row['own']}/{MIN_OWN_TO_DROP_BUNDLED})")
                 if row["junk"]:
@@ -1877,9 +1911,9 @@ class HoloToolGUI(tk.Tk):
             lines.append("　→ 按下面的「清掉裁切壞的樣板」刪掉，再重新抓一次。")
         if not lines:
             lines.append("已經蒐集齊全，而且每個標籤都有足夠的自己抓的樣板，"
-                         "52 張牌都認得出來了！")
+                         "52 張牌加鬼牌都認得出來了！")
         lines.append("（中央大圖案是數字牌中間那個大花色，用來把黑桃跟梅花分清楚，"
-                     "存數字牌時會自動一起存。）")
+                     "存數字牌時會自動一起存。鬼牌代號填 JK，只會存點數那一格。）")
         self.tmpl_missing.config(state=tk.NORMAL)
         self.tmpl_missing.delete("1.0", tk.END)
         self.tmpl_missing.insert("1.0", "\n".join(lines))

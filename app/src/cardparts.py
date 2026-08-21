@@ -32,6 +32,26 @@ SUITS = ("S", "H", "D", "C")
 RED_SUITS = ("H", "D")
 BLACK_SUITS = ("S", "C")
 
+# 鬼牌（Joker）當成「第 14 個點數」處理。
+#
+# 這個遊戲的鬼牌左上角印的不是點數字，而是一個「$」符號，右下角一樣印一次
+# （轉 180 度），版面跟其他 52 張牌**完全一致** —— 所以整條角落判讀的路
+# （切角落 → 二值化 → 正規化 → 雙角平均 → 比對）原封不動就能用，只要多一個
+# 標籤。實測（使用者實機 1365x576 原生截圖 + 他自己抓的 97 張點數樣板）：
+#
+#   * 雙角交叉驗證（右下角當樣板、左上角當查詢）：JK=0.80，第二名 8=0.66，
+#     領先 0.14，遠高於 part_min_margin 0.05。
+#   * 反例：另外 42 格真牌，鬼牌樣板拿到的最高分只有 0.66，而每一格真正的
+#     答案都在 0.72~0.95 —— 加進去之後那 42 格的判讀結果**一格都沒變**。
+#
+# 沒有鬼牌樣板時（rank 銀行裡沒有 "JK"）行為與加這個功能之前完全相同。
+JOKER_RANK = "JK"
+
+# 點數樣板可以有的所有標籤。**`RANKS` 本身刻意不含 JK**：很多地方要的是真正的
+# 13 個點數（「還缺哪幾個點數」、「同一比較組要不要丟掉內建樣板」），
+# 詳見 COMPARISON_GROUPS 上面的說明。
+RANK_LABELS = RANKS + (JOKER_RANK,)
+
 # 角落各部位佔整張卡的比例（以「白色卡身」的左上角為原點）。
 # 這些數字是從實機截圖量出來的，跨多張截圖非常一致：
 #   點數字 y 約 0.03~0.12、花色 y 約 0.125~0.19、兩者 x 都在 0.02~0.21。
@@ -302,7 +322,38 @@ def rightmost_card_rect(
     glyph_x0 = clusters[-1][0]
     left = max(0, bx + glyph_x0 - int(round(expected_w * 0.045)))
     left = min(left, max(0, strip.shape[1] - 4))
-    return left, by, expected_w, expected_h
+
+    # 回傳**量到的**牌寬牌高，不是校準框換算出來的 expected_*。
+    #
+    # 這一行以前是 `return left, by, expected_w, expected_h`，兩個值都錯：
+    #
+    # * 高度直接把呼叫端傳進來的**長條高度**當成牌高（實機 240 對真正的 210）。
+    # * 寬度是校準框換算的 expected_w，實機量測 160 vs 真實牌寬 149，差 11px。
+    #
+    # 角落是按「牌寬/牌高的固定比例」切的（CORNER_X、RANK_Y、SUIT_Y），
+    # 差 11px 就足以讓右下角整個切歪 —— 實測右下角把 8 讀成「10」(0.593)，
+    # 然後兩角平均之後領先幅度不足，整張牌判成「認不出來」，bot 卡死。
+    #
+    # 牌的右緣就是白色區塊的右緣（它是最右邊那張），左緣由點數字定位出來，
+    # 兩者相減就是真正的牌寬；牌高則是白色卡身區塊自己的高度。
+    width = _sane_measure(bx + bw - left, expected_w)
+    height = _sane_measure(bh, expected_h)
+    return left, by, width, height
+
+
+# 量到的尺寸要落在校準值的這個倍率區間內才採信。
+# 太小 = 只量到牌的一小角；太大 = 白色區塊黏到旁邊的面板或別張牌。
+# 兩種情況拿去切角落都比校準值更糟，所以退回校準值。
+MEASURE_LOW, MEASURE_HIGH = 0.5, 1.4
+
+
+def _sane_measure(measured: int, expected: int) -> int:
+    """量到的尺寸離譜就退回校準值。"""
+    if expected <= 0:
+        return int(measured)
+    if expected * MEASURE_LOW <= measured <= expected * MEASURE_HIGH:
+        return int(measured)
+    return int(expected)
 
 
 def extract_parts(
@@ -316,17 +367,25 @@ def extract_parts(
     回傳 {"rank": 灰階小圖, "suit": 灰階小圖, "is_red": bool, "corner": 角落彩圖}，
     取不到就回傳 None。
 
-    expected_w / expected_h 是「完整一張卡在畫面上的像素大小」。比大小畫面的
-    歷史牌只露出左邊一小條，偵測到的卡身寬度會遠小於實際卡寬，這時角落大小要
-    依 expected 值算，不能依偵測到的寬度。
+    expected_w / expected_h 是「完整一張卡在畫面上的像素大小」，用在**沒有傳
+    rect** 的情況（選牌畫面那五格）：那裡是直接對整格找白色卡身，偵測到的邊框
+    可能被陰影或圓角吃掉幾像素，校準框換算出來的值反而穩定。
+
+    **有傳 rect 就以 rect 為準。** 呼叫端會傳 rect 只有一種情形：比大小畫面，
+    而那個 rect 是 `rightmost_card_rect()` 在畫面上**實際量出來**的牌框。
+    以前這裡讓 `expected_*` 蓋過 rect，等於把辛苦量到的尺寸丟掉再用校準值 ——
+    實機 160 對真實牌寬 149，角落按比例切下去右下角整個歪掉。
     """
     if rect is None:
         rect = card_body_rect(roi)
-    if rect is None:
-        return None
-    bx, by, bw, bh = rect
-    ref_w = expected_w if expected_w > 0 else bw
-    ref_h = expected_h if expected_h > 0 else bh
+        if rect is None:
+            return None
+        bx, by, bw, bh = rect
+        ref_w = expected_w if expected_w > 0 else bw
+        ref_h = expected_h if expected_h > 0 else bh
+    else:
+        bx, by, bw, bh = rect
+        ref_w, ref_h = bw, bh
     if ref_w < 24 or ref_h < 32:
         return None
 
@@ -617,6 +676,11 @@ MIN_OWN_TO_DROP_BUNDLED = 3
 # 如果 H 有 3 張自己的、D 只有 1 張，各自決定的結果會是「3 張清楚的 H
 # vs 1 張清楚的 D + 8 張糊的 D」—— 一場不公平的比賽，而且偏向錯的那邊。
 # 同組一起判斷就不會出現這種情況。
+# 鬼牌**不可以**放進 rank 這一組。這一組是「全有全無」的：只要組裡有任何一個
+# 標籤自己抓的樣板還不到 3 張，整組就繼續混用內建糊圖。內建樣板裡沒有、也不會有
+# 鬼牌（52 張標準牌才有內建圖），所以把 JK 放進來就等於永遠 `enough = False`，
+# 一個已經抓滿樣板的使用者會在升級後突然又被塞回內建糊圖 —— 辨識率無聲倒退。
+# JK 沒有列在任何一組裡，`_group_for` 會讓它自成一組，互不影響。
 COMPARISON_GROUPS: dict = {
     "suit": (("H", "D"), ("S", "C")),
     "pip": (("H", "D"), ("S", "C")),
@@ -905,7 +969,7 @@ def _score_bank(query, bank: dict, align: int = 1) -> dict:
 
 
 def _best_match(query, bank: dict, min_score: float, min_margin: float, align: int = 1,
-                query2=None):
+                query2=None, two_corner_agreement: bool = True):
     """比對一個部位。`query2` 是同一張牌另一個角落（右下角轉正）的同部位小圖。
 
     整張牌會把點數與花色各印兩次：左上角一次、右下角旋轉 180 度再一次。
@@ -917,18 +981,39 @@ def _best_match(query, bank: dict, min_score: float, min_margin: float, align: i
     if not bank:
         return None
     scores = _score_bank(query, bank, align)
+    agreed_label = None
     if query2 is not None:
         other = _score_bank(query2, bank, align)
         # 先確認那個角落真的切到牌角。比大小畫面的牌會超出校準框，右下角切到的
         # 是牌桌背景，這種垃圾資料全部只有 0.5~0.6 分，正常牌角則是 0.8 以上，
         # 差距非常乾淨，用同一個門檻擋掉即可（擋掉就退回只看左上角）。
         if other and max(other.values()) >= min_score:
+            first = max(scores, key=lambda k: scores[k])
+            if two_corner_agreement and max(other, key=lambda k: other[k]) == first:
+                agreed_label = first
             scores = {k: (v + other.get(k, v)) / 2.0 for k, v in scores.items()}
     ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
     best_label, best = ranked[0]
     second = ranked[1][1] if len(ranked) > 1 else -1.0
     if best < min_score:
         return None
+    # 兩個角落**各自**的第一名是同一個答案 —— 那是兩次獨立取樣得到同一個結論，
+    # 比「平均之後領先第二名多少」有力得多。實機 8♦：左上 0.834、右下 0.808
+    # 都指向 8，平均後領先只有 0.04 < 門檻 0.05，於是整張牌判成「認不出來」，
+    # 而在比大小畫面認不出來的代價是**完全卡住**。
+    # 領先幅度本來就是為了「只有一次取樣、不確定」而設的保險，兩角一致時它已經
+    # 沒有在防什麼了。只有一個角落時照舊嚴格（見下面那行）。
+    #
+    # ⚠️ 但這條規則**只開給比大小**（`two_corner_agreement`，由
+    # `classify_parts` 依 `rank_last_resort` 決定）。原因是「兩角是兩次獨立取樣」
+    # 這個前提在**蓋著的牌**上不成立：牌背是旋轉 180 度對稱的圖案，左上角與
+    # 右下角切出來根本是同一張圖，於是**必然一致**，一致規則就變成無條件放寬。
+    # 實測投注畫面（五張全蓋著）：無條件開啟時誤判從 1/5 變成 3/5，
+    # 而 `draw_prompt_soft_threshold` 有一條「五張都認得出來就當成選牌畫面」的
+    # 路 —— 再往上飄就會在投注畫面上跑選牌流程。比大小畫面沒有蓋著的白色卡身
+    # （牌背是紫的，`card_body_rect` 選不到），所以那條路沒有這個風險。
+    if agreed_label is not None and best_label == agreed_label:
+        return best_label, best
     if second >= 0 and (best - second) < min_margin:
         return None
     return best_label, best
@@ -975,13 +1060,18 @@ def classify_parts(
     if not rank_bank or not suit_bank:
         return None
 
+    # `two_corner_agreement` 只開給比大小（`rank_last_resort` 就是「這是比大小」
+    # 的旗標）。理由見 `_best_match` 裡那段警告：牌背是 180 度對稱的，兩角必然
+    # 一致，在選牌畫面無條件開啟會讓投注畫面的蓋牌被讀成真牌。
     rank = _best_match(parts["rank"], rank_bank, min_score, min_margin,
-                       query2=parts.get("rank2"))
+                       query2=parts.get("rank2"),
+                       two_corner_agreement=rank_last_resort)
     if rank is None and rank_last_resort:
         # 只放寬「領先幅度」，`min_score` 一律照舊 —— 分數本身沒過代表
         # 根本不像任何一個點數（框沒對準、切壞了），那種情況硬猜沒有意義。
         relaxed = _best_match(parts["rank"], rank_bank, min_score, 0.0,
-                              query2=parts.get("rank2"))
+                              query2=parts.get("rank2"),
+                              two_corner_agreement=True)
         if relaxed is not None:
             rank = relaxed
             if notes is not None:
@@ -995,6 +1085,13 @@ def classify_parts(
                 )
     if rank is None:
         return None
+
+    # 鬼牌沒有花色 —— 角落只有一個「$」，卡面中央是那隻怪物插圖。
+    # 這裡如果照常往下跑，`is_red` 會拿 $ 下半截的墨色去分紅黑，然後硬把
+    # 黑桃或梅花配上去，最後回傳 "JKS" 這種 `Card.from_label` 認得、但意思
+    # 完全錯掉的標籤。直接在這裡收工，回傳乾淨的 "JK"。
+    if rank[0] == JOKER_RANK:
+        return JOKER_RANK, rank[1]
 
     # 花色先用顏色縮到兩個候選（紅黑判斷實測 54/54 全對），剩下只要二選一
     candidates = RED_SUITS if parts["is_red"] else BLACK_SUITS
@@ -1011,7 +1108,8 @@ def classify_parts(
         # 打結的情況，所以左上 + 右下兩顆一起比。
         bank = {k: v for k, v in suit_bank.items() if k in candidates}
         suit = _best_match(parts["suit"], bank, min_score, CORNER_SUIT_MIN_MARGIN,
-                           query2=parts.get("suit2"))
+                           query2=parts.get("suit2"),
+                           two_corner_agreement=rank_last_resort)
         if suit is None and bank:
             # 點數已經確定了，只有花色分不出黑桃/梅花（或紅心/方塊）時，
             # **不要整張牌報「認不出來」**。回報「認不出來」的代價是 bot 卡住
@@ -1056,6 +1154,19 @@ def explain_parts(parts: dict, templates: dict, min_score: float = DEFAULT_MIN_S
             why = f" ←領先不足 {min_margin}"
         bits.append(f"點數 {detail}{why}")
 
+    # 第一名就是鬼牌時不要再談花色 —— 鬼牌沒有花色，印出來只會叫使用者去補
+    # 一個根本不存在的樣板。
+    if top and top[0][0] == JOKER_RANK:
+        bits.append("＝鬼牌（沒有花色）")
+        return " | ".join(bits)
+
+    # 「所有點數都不像」而且**還沒有鬼牌樣板**時，最可能的原因就是這一格是鬼牌。
+    # 以前這條路只會叫使用者去調 part_min_score，愈調愈糟：鬼牌的 $ 對每一個
+    # 點數都只有 0.6 上下，門檻調到那麼低反而開始把真牌認錯。
+    if top and top[0][1] < min_score and JOKER_RANK not in (templates.get("rank") or {}):
+        bits.append("（都不像 → 這一格如果是鬼牌，請到「點數/花色樣板」"
+                    "讀取畫面、代號填 JK 再儲存；門檻不用調）")
+
     colour = "紅" if parts["is_red"] else "黑"
     candidates = RED_SUITS if parts["is_red"] else BLACK_SUITS
     # 只有數字牌才有中央大圖案；J/Q/K 是人像，中間讀到的是衣服，不能拿來當花色
@@ -1095,8 +1206,18 @@ def recognize_by_corner(
 
 
 def missing_parts(templates: dict) -> tuple[list[str], list[str]]:
-    """回傳 (還缺的點數, 還缺的花色)。"""
+    """回傳 (還缺的點數, 還缺的花色)。
+
+    **鬼牌不算在「還缺的點數」裡**：它不是 52 張牌的一部分，沒有它一樣認得出
+    全部的普通牌，把它混進來會讓「已經蒐集齊全」永遠不成立。要不要提醒使用者
+    抓鬼牌，用 `joker_template_count()` 另外判斷。
+    """
     have_rank = set((templates.get("rank") or {}).keys())
     have_suit = set((templates.get("suit") or {}).keys())
     return ([r for r in RANKS if r not in have_rank],
             [s for s in SUITS if s not in have_suit])
+
+
+def joker_template_count(templates: dict) -> int:
+    """目前實際會拿來比對的鬼牌樣板有幾張（0 = 抽到鬼牌一定認不出來）。"""
+    return len((templates.get("rank") or {}).get(JOKER_RANK) or [])

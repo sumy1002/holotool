@@ -178,22 +178,31 @@ def main() -> None:
         print(f"{OK} 畫面標記樣板解析度：{tmpl_w} 寬（與目前視窗相符）")
 
     # 7. 點數 / 花色樣板
+    from src.cardparts import joker_template_count as _joker_count
     from src.cardparts import missing_parts as _missing_parts
     from src.recognize import load_part_templates as _load_parts
     parts = _load_parts()
     miss_rank, miss_suit = _missing_parts(parts)
-    n_rank = len(parts.get("rank") or {})
+    n_joker = _joker_count(parts)
+    n_rank = len(parts.get("rank") or {}) - (1 if n_joker else 0)
     n_suit = len(parts.get("suit") or {})
     n_pip = len(parts.get("pip") or {})
+    summary = (f"點數 {n_rank}/13、花色 {n_suit}/4（中央大圖案 {n_pip}/4）、"
+               f"鬼牌 {'有' if n_joker else '無'}")
     if not miss_rank and not miss_suit:
-        print(f"{OK} 點數/花色樣板：點數 {n_rank}/13、花色 {n_suit}/4（中央大圖案 {n_pip}/4）")
+        print(f"{OK} 點數/花色樣板：{summary}")
     else:
-        print(f"{NG} 點數/花色樣板：點數 {n_rank}/13、花色 {n_suit}/4（中央大圖案 {n_pip}/4）")
+        print(f"{NG} 點數/花色樣板：{summary}")
         if miss_rank:
             print(f"       ↳ 還缺點數：{'  '.join(miss_rank)}")
         if miss_suit:
             print(f"       ↳ 還缺花色：{'  '.join(miss_suit)}")
         todo.append("在 gui.py 的「點數/花色樣板」分頁補齊（只要 13 點數 + 4 花色，不用 52 張）")
+    # 鬼牌單獨講：它不算在 13 個點數裡，但沒有它的話抽到鬼牌那一格永遠認不出來，
+    # 選牌畫面只有 4/5，bot 會停在那裡（自救逾時後才會硬做，期望值變差）。
+    if not n_joker:
+        print(f"{NG} 鬼牌（JK）樣板：還沒有 —— 抽到鬼牌那一格會認不出來")
+        todo.append("看到鬼牌時到「點數/花色樣板」分頁讀取畫面、代號填 JK 存一次")
 
     # 7b. 整張卡面樣板（備援機制，可有可無）
     found = collected_card_labels()

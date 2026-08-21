@@ -11,7 +11,15 @@ from .geometry import aspect_ratio_delta, scale_factor
 from .handeval import Card, classify_hand, hand_name
 from .logger import log
 from .paths import resolve_data_path
-from .cardparts import MIN_PART_COVERAGE, RANKS, SUITS, missing_parts, unusable_parts
+from .cardparts import (
+    JOKER_RANK,
+    MIN_PART_COVERAGE,
+    RANKS,
+    SUITS,
+    joker_template_count,
+    missing_parts,
+    unusable_parts,
+)
 from .defaults_layout import BUNDLED_MARKER_WIDTH
 from .recognize import (
     CardReader,
@@ -23,6 +31,15 @@ from .recognize import (
 from .state_machine import IDLE_SLOT_MAX_VALUE, detect_frame, expected_marker_scale
 from .stats import DailyStats
 from .strategy import decide_high_or_low, decide_hold, should_continue_highlow
+
+
+def _rank_of(label: str) -> str:
+    """牌面標籤 → 點數。"10H" → "10"、"JK" → "JK"。
+
+    鬼牌沒有花色，`label[:-1]` 會把它切成 "J" —— 剛好是一個真的點數，
+    於是自救那段會以為手上有一張 J，可能配出一個根本不存在的對子。
+    """
+    return JOKER_RANK if label.strip().upper().startswith(JOKER_RANK) else label[:-1]
 
 
 class Bot:
@@ -72,6 +89,12 @@ class Bot:
         self._acted_at = 0.0
         self._act_count = 0
         self._idle_since: float | None = None
+
+        # 選牌畫面「五張沒認齊」的自救計時（見 _handle_partial_draw）。
+        # 這兩個一定要在 __init__ 就存在，不能只在 _reset_round_state 裡設 ——
+        # 那個只有按 F9 啟動時才會跑，測試與任何提早進入的路徑都會 AttributeError。
+        self._partial_draw_signature: tuple | None = None
+        self._partial_draw_since: float | None = None
 
         if self.ui_templates.get("table_marker") is None:
             log("[警告] 尚未設定牌桌標記樣板 (table_marker.png)，將無法自動偵測『已達每日上限』，請先完成校準。")
@@ -157,10 +180,20 @@ class Bot:
             miss_rank, miss_suit = missing_parts(self.part_templates)
             n_rank = len(self.part_templates.get("rank") or {})
             n_suit = len(self.part_templates.get("suit") or {})
+            n_joker = joker_template_count(self.part_templates)
             log(
                 f"畫面標記樣板：{('、'.join(loaded) if loaded else '無')}；"
-                f"點數樣板 {n_rank}/13、花色樣板 {n_suit}/4；整張卡面樣板 {card_n} 張"
+                f"點數樣板 {n_rank - (1 if n_joker else 0)}/13、花色樣板 {n_suit}/4；"
+                f"鬼牌樣板 {n_joker} 張；整張卡面樣板 {card_n} 張"
             )
+            if not n_joker:
+                log(
+                    "[提醒] 還沒有鬼牌（JK）樣板。抽到鬼牌時那一格會認不出來，"
+                    "選牌畫面只有 4/5；程式會等 "
+                    f"{float(self.cfg.get('partial_draw_rescue_sec', 20.0)):.0f} 秒後"
+                    "用認得出來的牌硬做，但期望值會變差。"
+                    "看到鬼牌時到「點數/花色樣板」分頁讀取畫面、代號填 JK 存一次就好。"
+                )
             if miss_rank or miss_suit:
                 log(
                     f"[提醒] 還缺點數 {('、'.join(miss_rank) or '無')}；"
@@ -263,6 +296,8 @@ class Bot:
         self._acted_at = 0.0
         self._act_count = 0
         self._idle_since = None
+        self._partial_draw_signature = None
+        self._partial_draw_since = None
 
     # ---------- 動作節奏 ----------
 
@@ -464,9 +499,12 @@ class Bot:
         if frame.is_draw:
             recognized = [s for s in frame.slot_cards if s is not None]
             if len(recognized) == 5:
+                self._clear_partial_draw_timer()
                 self._handle_draw_phase(frame)
-            elif self._status_ticks % 8 == 1:
-                self._explain_missing_cards(frame)
+            else:
+                if self._status_ticks % 8 == 1:
+                    self._explain_missing_cards(frame)
+                self._handle_partial_draw(frame)
             return
         if frame.highlow_card is not None:
             self._handle_highlow_phase(frame)
@@ -536,6 +574,98 @@ class Bot:
         self._act_count = 1
         self._awaiting_draw_result = True
         self._draw_confirm_at = time.time()
+
+    def _clear_partial_draw_timer(self) -> None:
+        """認齊五張了 —— 下一次認不齊要從頭數，不能延用上一次的計時。"""
+        self._partial_draw_signature = None
+        self._partial_draw_since = None
+
+    def _handle_partial_draw(self, frame) -> None:
+        """五張手牌沒認齊時的自救閘門。
+
+        ## 為什麼需要
+
+        原本 `_tick` 是 `if len(recognized) == 5:` 才動作，**沒有 else**：
+        只要有一格認不出來，bot 就安靜地停在選牌畫面，一直印「只認出 4/5」，
+        直到有人來按 F9。使用者遇到的就是這個 —— 一張鬼牌讓整晚的任務停擺。
+
+        鬼牌那個特定原因已經修好了（見 `cardparts.JOKER_RANK`），但「一格認不出來
+        ＝整個流程停擺」這個結構性問題還在：反光、動畫殘影、之後遊戲改版換張新牌，
+        任何一個都會再次造成同樣的死結。所以這裡加一道有時限的自救。
+
+        ## 為什麼要等這麼久才動手
+
+        認不出來的原因**絕大多數是暫時的**（發牌動畫、卡片翻轉的過渡影格）。
+        急著動手只會把還沒發完的牌換掉。所以要求「同一組認不齊的結果連續維持
+        `partial_draw_rescue_sec` 秒」才算真的卡住 —— 只要有任何一格的判讀改變，
+        計時就重新開始。
+
+        ## 動手時做什麼
+
+        只用**認得出來的牌**做決定，而且只做最沒有爭議的那一種保留：**留對子**。
+        不跑蒙地卡羅 —— 那需要完整的五張牌，硬塞四張進去算出來的期望值是假的。
+        認不出來的那幾格一律當成要換掉（本來就沒有資訊可以支持留下它）。
+
+        代價很清楚：這一局的期望值比正常情況差一點。但另一邊的代價是任務停擺，
+        兩者差了好幾個數量級 —— 這跟 `classify_parts` 對比大小放寬領先幅度是
+        同一個取捨。設定 `partial_draw_rescue_sec = 0` 可以把自救整個關掉。
+        """
+        wait = float(self.cfg.get("partial_draw_rescue_sec", 20.0))
+        if wait <= 0:
+            return
+
+        signature = tuple(s[0] if s is not None else None for s in frame.slot_cards)
+        now = time.time()
+        if signature != self._partial_draw_signature:
+            # 判讀還在變 = 畫面還在動，重新計時
+            self._partial_draw_signature = signature
+            self._partial_draw_since = now
+            return
+        if self._partial_draw_since is None or now - self._partial_draw_since < wait:
+            return
+        if not self._should_act("draw"):
+            return
+
+        known = [(i, s[0]) for i, s in enumerate(frame.slot_cards) if s is not None]
+        unknown = [i + 1 for i, s in enumerate(frame.slot_cards) if s is None]
+        counts: dict[str, int] = {}
+        for _i, label in known:
+            rank = _rank_of(label)
+            counts[rank] = counts.get(rank, 0) + 1
+        keep_idx = [i for i, label in known if counts.get(_rank_of(label), 0) >= 2]
+
+        log(
+            f"[選牌自救] 第 {unknown} 張已經連續 {wait:g} 秒認不出來，不能一直停在這裡。"
+            f"改用認得出來的 {[l for _i, l in known]} 做決定："
+            + (f"保留 {keep_idx}（有對子）" if keep_idx else "沒有對子，五張全換")
+            + "。這一局的期望值會比正常情況差 —— 想根治請照上面那幾行補樣板。"
+        )
+        if self.dry_run:
+            log("[dry-run] 未執行實際點擊")
+            self._partial_draw_since = now
+            return
+
+        gap = float(self.cfg.get("multi_click_gap_sec", 0.18))
+        for idx in keep_idx:
+            self.mouse.click_point(self.cfg["points"]["hold_toggles"][idx])
+            time.sleep(gap)
+        confirm = self.cfg["points"].get("draw_confirm")
+        if confirm and (confirm["x"] or confirm["y"]):
+            self.mouse.click_point(confirm)
+        self.stats.bump("rounds_started")
+        self.stats.record_event(
+            "partial_draw_rescue",
+            {"known": [l for _i, l in known], "unknown": unknown, "kept": keep_idx},
+        )
+        self._acted_state = "draw"
+        self._acted_at = time.time()
+        self._act_count = 1
+        self._awaiting_draw_result = True
+        self._draw_confirm_at = time.time()
+        # 這一手牌不要再進 `_handle_draw_phase` 的「同一手牌 = 遊戲漏收」重試，
+        # 也讓下一次自救必須重新等滿一整個 wait。
+        self._last_slot_signature = None
+        self._partial_draw_since = time.time()
 
     def _handle_highlow_phase(self, frame) -> None:
         label, score = frame.highlow_card
