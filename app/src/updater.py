@@ -193,10 +193,23 @@ def _parse_release(data: dict) -> ReleaseInfo:
             chosen = a
             break
     if chosen is None:
-        for a in zips:
-            if str(a.get("name", "")).lower().startswith("holotool-"):
-                chosen = a
-                break
+        # **版本對不上的整包一律拒絕，不要退而求其次。**
+        #
+        # 2026-08-22 實際發生過：v1.0.22 的資產裡放的是 `HoloTool-1.0.20.zip`
+        # （上傳時挑錯檔）。舊的退路「開頭是 HoloTool- 的第一個 zip」會挑到它，
+        # 然後把 1.0.20 的檔案蓋到使用者的安裝上 —— **降級**。而且 exe 之後
+        # 自報 1.0.20，又看到「有 1.0.22」，變成無限更新迴圈；
+        # 連 .sha256 都是配對的，所以驗證還會通過，全程不會有任何錯誤訊息。
+        mismatched = sorted(
+            str(a.get("name", "")) for a in zips
+            if str(a.get("name", "")).lower().startswith("holotool-"))
+        if mismatched:
+            raise UpdateError(
+                f"Release {tag} 裡找不到 {asset_name(version)}，"
+                f"只看到 {'、'.join(mismatched[:3])}。\n"
+                "版本對不上的更新包套上去會把程式降級，所以這次更新中止。\n"
+                "（發版的人：請把正確版本的 zip 傳上去，或直接到 Release 頁面手動下載。）"
+            )
     if chosen is None and zips:
         chosen = zips[0]
     if chosen is None:

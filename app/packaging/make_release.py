@@ -38,6 +38,7 @@ import os
 import subprocess
 import sys
 import zipfile
+import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))   # app\packaging\
 ROOT = os.path.dirname(HERE)                        # app\
@@ -171,27 +172,88 @@ def _zip_fingerprints(path: str) -> dict:
         for info in zf.infolist():
             if info.is_dir():
                 continue
-            out[info.filename.replace("\\", "/")] = (info.CRC, info.file_size)
+            name = info.filename.replace("\\", "/")
+            if _skip(name):
+                continue
+            out[name] = (info.CRC, info.file_size)
     return out
 
 
-def _previous_release_zip(out_dir: str, version: str):
-    """找版本比現在小、而且最大的那個整包 zip。回傳 (版本, 路徑)。
+def _dir_fingerprints(root: str) -> dict:
+    """同上，但對象是一個「上一版的安裝資料夾」。
 
-    **基準線就是上一版的整包本身**，不需要另外維護一份清單檔 ——
-    少一個「不要刪這個檔」的坑，而且對已經發出去的舊版也能回溯生效。
+    `release.bat` 每次發版前都會把當時的 build 原封複製到
+    `<磁碟>\holotool-test-<舊版本>`（那是拿來測自動更新的「舊版」），
+    所以就算 `app\dist\` 裡的舊 zip 被清掉了，通常還有這一份可以當基準。
+
+    **一定要套用跟打包相同的排除規則** —— 那個資料夾裡有使用者的
+    `config\`、`card_templates\`、`logs\`，不濾掉的話會被算成「有變動」
+    而塞進差分包，然後 `_assert_no_user_data()` 直接讓發版失敗。
     """
+    out = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d.lower() not in EXCLUDE_DIRS]
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, root).replace("\\", "/")
+            if _skip(rel):
+                continue
+            crc = 0
+            try:
+                with open(full, "rb") as f:
+                    for block in iter(lambda: f.read(1 << 20), b""):
+                        crc = zlib.crc32(block, crc)
+                size = os.path.getsize(full)
+            except OSError:
+                continue
+            out[rel] = (crc, size)
+    return out
+
+
+def _previous_bundles(out_dir: str) -> list:
+    """所有可以當「上一版」的東西，回傳 [(版本, 讀取函式, 路徑)]。
+
+    兩種來源，缺一不可：
+
+    * `app\dist\HoloTool-<版本>.zip` —— 上一次發版的整包。最準。
+    * `<磁碟>\holotool-test-<版本>\` —— `release.bat` 發版前留的那份 build。
+      **舊 zip 很佔空間（一個 76 MB），被清掉是很正常的事**，
+      這一條就是為那種情況準備的。
+    """
+    found = []
+    if os.path.isdir(out_dir):
+        for name in os.listdir(out_dir):
+            if not (name.startswith("HoloTool-") and name.endswith(".zip")):
+                continue
+            if parse_patch_asset_name(name) is not None:   # 差分包不是基準線
+                continue
+            found.append((name[len("HoloTool-"):-len(".zip")],
+                          _zip_fingerprints, os.path.join(out_dir, name)))
+
+    # release.bat 的測試副本放在專案所在磁碟的根目錄旁邊
+    neighbours = os.path.dirname(PROJECT) or PROJECT
+    prefix = "holotool-test-"
+    try:
+        entries = os.listdir(neighbours)
+    except OSError:
+        entries = []
+    for name in entries:
+        full = os.path.join(neighbours, name)
+        if name.lower().startswith(prefix) and os.path.isdir(full):
+            found.append((name[len(prefix):], _dir_fingerprints, full))
+    return found
+
+
+def _previous_bundle(out_dir: str, version: str):
+    """挑版本比現在小、而且最大的那一個。同版本時優先用 zip（比較準也比較快）。"""
     best = None
-    for name in os.listdir(out_dir):
-        if not (name.startswith("HoloTool-") and name.endswith(".zip")):
-            continue
-        if parse_patch_asset_name(name) is not None:      # 差分包不是基準線
-            continue
-        other = name[len("HoloTool-"):-len(".zip")]
+    for other, reader, path in _previous_bundles(out_dir):
         if version_tuple(other) >= version_tuple(version):
             continue
-        if best is None or version_tuple(other) > version_tuple(best[0]):
-            best = (other, os.path.join(out_dir, name))
+        if best is None or version_tuple(other) > version_tuple(best[0]) or (
+                version_tuple(other) == version_tuple(best[0])
+                and reader is _zip_fingerprints):
+            best = (other, reader, path)
     return best
 
 
@@ -201,13 +263,16 @@ def build_patch_zip(out_dir: str, version: str, full_zip: str):
     **刪除的檔案表達不出來** —— 置換用的 robocopy 本來就沒有 /PURGE，
     整包更新也不會刪任何東西，所以兩邊行為一致，不算新的缺口。
     """
-    previous = _previous_release_zip(out_dir, version)
+    previous = _previous_bundle(out_dir, version)
     if previous is None:
-        print("\n（`app\\dist\\` 裡沒有更早的整包 zip，這一版只出整包；"
-              "下一版起就有基準可以做差分了）")
+        print(f"\n（找不到任何更早的版本可以當基準，這一版只出整包。"
+              f"\n  找過：{out_dir}\\HoloTool-*.zip"
+              f"\n  　　　{os.path.dirname(PROJECT)}\\holotool-test-*\\"
+              f"\n  下一版起就有基準可以做差分了 —— 別把這兩個地方都清掉。）")
         return None
-    base, base_zip = previous
-    old = _zip_fingerprints(base_zip)
+    base, reader, base_path = previous
+    print(f"\n差分基準：{base_path}")
+    old = reader(base_path)
     new = _zip_fingerprints(full_zip)
     changed = sorted(name for name, fp in new.items() if old.get(name) != fp)
     if not changed:
