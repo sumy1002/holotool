@@ -100,6 +100,7 @@ from src.paths import (
     default_parts_dir,
     parts_dir,
     prepare_runtime,
+    project_root,
     resolve_data_path,
     template_dir,
 )
@@ -111,6 +112,7 @@ from src.version import __version__ as APP_VERSION
 
 TEMPLATE_DIR = template_dir()
 PARTS_DIR = parts_dir()
+PROJECT_ROOT = project_root()
 
 # (kind, path, name, hint, group_title)
 # group_title 用來在「依序校準」時提示使用者先切到對應畫面
@@ -433,6 +435,19 @@ class HoloToolGUI(tk.Tk):
         self.profile_status = ttk.Label(win_box, text="", foreground="#06c", justify="left",
                                        wraplength=760)
         self.profile_status.grid(row=3, column=0, columnspan=3, padx=6, pady=(0, 8), sticky="w")
+
+        # 「把目前這個畫面原封不動存成 PNG」。
+        # 為什麼需要這顆：截圖貼進對話會被重新壓縮縮小，內建標記樣板就是這樣變成
+        # 1024 寬的糊圖（實機 1365 → 比對時放大 1.33 倍 → 選牌分數只有 37%）。
+        # 自己用截圖工具裁也很容易連標題列一起裁進去、或是被系統縮放動過。
+        # 由程式直接抓「用戶端區域」存檔，尺寸一定正確，檔名也帶著解析度。
+        shot_row = ttk.Frame(win_box)
+        shot_row.grid(row=4, column=0, columnspan=3, padx=6, pady=(0, 8), sticky="we")
+        ttk.Button(shot_row, text="存一張目前畫面（PNG）",
+                   command=self._save_debug_shot).pack(side=tk.LEFT)
+        self.shot_status = ttk.Label(shot_row, text="", foreground="#555", justify="left",
+                                     wraplength=520)
+        self.shot_status.pack(side=tk.LEFT, padx=(8, 0))
 
         ctrl_box = ttk.LabelFrame(frame, text="自動遊玩")
         ctrl_box.pack(fill=tk.X, padx=8, pady=6)
@@ -1429,6 +1444,48 @@ class HoloToolGUI(tk.Tk):
         self._refresh_calib_status()
         logger.log("已套用截圖預設框選，並還原畫面標記樣板")
         messagebox.showinfo("完成", "已套用預設框選。若有對不準的項目，在清單裡選取後再單獨校準即可。")
+
+    def _save_debug_shot(self) -> None:
+        """把遊戲視窗的用戶端畫面原封不動存成 PNG。
+
+        用途有兩個：
+        1. 回報問題時附一張沒有被壓縮過的原圖；
+        2. 升級「內建畫面標記樣板」—— 內建那批是 1024 寬的縮圖，實機視窗通常
+           更大，比對時要放大就會糊。有原生解析度的截圖，就能用
+           `tools/promote_ui_templates.py` 依校準座標把標記裁出來。
+
+        **一定要由程式來抓**：手動截圖很容易連視窗邊框／標題列一起裁進去，
+        或是被系統顯示縮放動過，那樣裁出來的樣板座標與尺寸都會對不上。
+        """
+        capture = GameCapture(self.cfg.get("window_title_substring", ""))
+        if not capture.locate():
+            self.shot_status.config(text="找不到遊戲視窗", foreground="#c00")
+            messagebox.showerror("找不到遊戲視窗",
+                                 "請先在上方清單選好遊戲視窗，並確認遊戲正在執行。")
+            return
+        try:
+            frame = capture.grab_full_client()
+        except Exception as e:  # noqa: BLE001
+            self.shot_status.config(text=f"擷取失敗：{e!r}", foreground="#c00")
+            return
+        if frame is None or getattr(frame, "size", 0) == 0:
+            self.shot_status.config(text="擷取到空白畫面", foreground="#c00")
+            return
+        height, width = frame.shape[:2]
+        folder = os.path.join(PROJECT_ROOT, "debug_captures")
+        os.makedirs(folder, exist_ok=True)
+        name = f"shot_{width}x{height}_{time.strftime('%Y%m%d-%H%M%S')}.png"
+        path = os.path.join(folder, name)
+        try:
+            ok = cv2.imwrite(path, frame)
+        except Exception as e:  # noqa: BLE001
+            ok = False
+            logger.log(f"[錯誤] 存畫面失敗：{e!r}")
+        if not ok:
+            self.shot_status.config(text="寫檔失敗（磁碟空間或權限）", foreground="#c00")
+            return
+        self.shot_status.config(text=f"已存 {name} → debug_captures", foreground="#0a6")
+        logger.log(f"已存畫面截圖 debug_captures\\{name}（{width}x{height}）")
 
     def _save_one_ui_marker(self, path: str) -> None:
         """框選標記區域的當下就存樣板，避免最後停在別的畫面時把樣板存錯。"""

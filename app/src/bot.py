@@ -12,6 +12,7 @@ from .handeval import Card, classify_hand, hand_name
 from .logger import log
 from .paths import resolve_data_path
 from .cardparts import MIN_PART_COVERAGE, RANKS, SUITS, missing_parts, unusable_parts
+from .defaults_layout import BUNDLED_MARKER_WIDTH
 from .recognize import (
     CardReader,
     load_card_templates,
@@ -227,7 +228,7 @@ class Bot:
             )
 
         tmpl_scale = expected_marker_scale(self.cfg, cur_w, cur_h)
-        tmpl_w = self.cfg.get("templates", {}).get("capture_client_width") or 1024
+        tmpl_w = self.cfg.get("templates", {}).get("capture_client_width") or BUNDLED_MARKER_WIDTH
         if abs(tmpl_scale - 1.0) > 0.05:
             log(
                 f"畫面標記樣板是在 {tmpl_w} 寬的視窗下擷取的，目前 {cur_w} 寬，"
@@ -572,6 +573,9 @@ class Bot:
             f"[比大小階段] 目前牌={label} 建議={decision.choice.upper()} 預估勝率={decision.win_prob:.1%} "
             f"(連續第 {self._highlow_chain} 次)。同點數會重抽，不計勝負。"
         )
+        note = getattr(self.reader, "last_note", "")
+        if note:
+            log(f"　　※ {note}")
 
         if self.dry_run:
             log("[dry-run] 未執行實際點擊")
@@ -584,6 +588,26 @@ class Bot:
             "highlow_guess",
             {"card": label, "choice": decision.choice, "win_prob": decision.win_prob},
         )
+
+    def _explain_missing_highlow(self) -> None:
+        """比大小的牌為什麼讀不到。
+
+        這條路以前完全沒有任何診斷：比大小畫面沒有畫面標記，讀不到牌就一路掉到
+        `_handle_idle`，log 只會叫使用者去調標記門檻 —— 而那個畫面沒有標記。
+        使用者只看得到「比大小=—」，完全不知道是框沒對準、卡身找不到、
+        還是點數分數差一點。
+        """
+        region = (self.cfg.get("regions") or {}).get("highlow_card") or {}
+        if region.get("w", 0) <= 0:
+            log("　　比大小：『比大小：目前已翻開的牌』還沒校準，這個畫面永遠認不出來。")
+            return
+        try:
+            roi = self.capture.grab_region(region)
+            height, width = roi.shape[:2]
+            why = self.reader.explain_rightmost(roi, width, height)
+        except Exception as e:  # noqa: BLE001
+            why = f"讀取失敗 {e!r}"
+        log(f"　　比大小認不到牌：{why}")
 
     def _explain_missing_cards(self, frame) -> None:
         """手牌沒認齊時，把每一格「差在哪」印出來，不要只說『請補樣板』。
@@ -731,8 +755,12 @@ class Bot:
                 shown = frame.slot_values or "（沒量到）"
                 log(f"[待機] 畫面認不出來，但五個牌位的亮度 {shown} 不像投注畫面"
                     f"（要全部 ≤ {self.cfg.get('idle_slot_max_value', IDLE_SLOT_MAX_VALUE)}），"
-                    "所以不點「投注並開始」。可能是比大小或對話框認不出來 —— "
-                    "看上面的分數哪一項最接近門檻，到「設定」分頁調低那一項。")
+                    "所以不點「投注並開始」。")
+                # **比大小畫面沒有任何畫面標記**，它是靠「讀到那張牌」來判斷的。
+                # 所以牌讀不到時，叫使用者「看哪個標記分數最接近門檻」是錯的方向
+                # —— 那個畫面根本沒有標記可以調。直接把牌讀不到的原因印出來。
+                self._explain_missing_highlow()
+                log("　　若上面說的是標記分數問題，才到「設定」分頁調低對應的門檻。")
             return
 
         self._last_slot_signature = None

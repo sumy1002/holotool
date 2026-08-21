@@ -934,13 +934,39 @@ def _best_match(query, bank: dict, min_score: float, min_margin: float, align: i
     return best_label, best
 
 
+def _rank_runner_up(parts: dict, rank_bank: dict, min_score: float,
+                    winner: str) -> Optional[tuple[str, float]]:
+    """第二名是誰。只給 log 用，所以算錯也不影響判斷。"""
+    scores = _score_bank(parts["rank"], rank_bank, 1)
+    other = _score_bank(parts["rank2"], rank_bank, 1) if parts.get("rank2") is not None else {}
+    if other and max(other.values()) >= min_score:
+        scores = {k: (v + other.get(k, v)) / 2.0 for k, v in scores.items()}
+    rest = [(k, v) for k, v in scores.items() if k != winner]
+    if not rest:
+        return None
+    return max(rest, key=lambda kv: kv[1])
+
+
 def classify_parts(
     parts: dict,
     templates: dict,
     min_score: float = DEFAULT_MIN_SCORE,
     min_margin: float = DEFAULT_MIN_MARGIN,
+    rank_last_resort: bool = False,
+    notes: Optional[list] = None,
 ) -> Optional[tuple[str, float]]:
-    """把 extract_parts() 的結果對上樣板，回傳 ("10H", 分數) 或 None。"""
+    """把 extract_parts() 的結果對上樣板，回傳 ("10H", 分數) 或 None。
+
+    `rank_last_resort` 只給**比大小畫面**用。那個畫面沒有任何畫面標記，
+    「讀不到牌」不會退回別的判斷，而是一路掉到待機、bot 就永遠卡在那裡
+    （使用者實際遇到的就是這個：`點數 8=0.84  5=0.79 ←領先不足 0.05`，
+    第一名是對的，卻因為只差 0.0498 被擋掉，然後只能按 F9 停掉）。
+    兩邊的代價完全不對等：猜錯點數只是這一次大小猜壞（而且 bot 本來就要求
+    連續兩次讀到同一張才動作），認不出來卻是整個任務停擺。
+    所以分數過了 `min_score`、只是領先幅度不夠時，就直接取第一名，並在
+    `notes` 裡留下記錄讓 log 大聲講出來。選牌畫面維持嚴格 —— 那裡讀錯牌會
+    直接影響湊牌決策，而且認不出來時使用者可以自己補樣板。
+    """
     if not parts or not templates:
         return None
     rank_bank = templates.get("rank") or {}
@@ -951,6 +977,22 @@ def classify_parts(
 
     rank = _best_match(parts["rank"], rank_bank, min_score, min_margin,
                        query2=parts.get("rank2"))
+    if rank is None and rank_last_resort:
+        # 只放寬「領先幅度」，`min_score` 一律照舊 —— 分數本身沒過代表
+        # 根本不像任何一個點數（框沒對準、切壞了），那種情況硬猜沒有意義。
+        relaxed = _best_match(parts["rank"], rank_bank, min_score, 0.0,
+                              query2=parts.get("rank2"))
+        if relaxed is not None:
+            rank = relaxed
+            if notes is not None:
+                runner_up = _rank_runner_up(parts, rank_bank, min_score, relaxed[0])
+                notes.append(
+                    f"點數領先幅度不足（{relaxed[0]}={relaxed[1]:.2f}"
+                    + (f"，第二名 {runner_up[0]}={runner_up[1]:.2f}" if runner_up else "")
+                    + f"，門檻 {min_margin}），比大小不能卡住，先採用第一名。"
+                    f"想更準就到「點數花色樣板」多補幾張 {relaxed[0]}"
+                    + (f" 和 {runner_up[0]}" if runner_up else "")
+                )
     if rank is None:
         return None
 
@@ -982,7 +1024,8 @@ def classify_parts(
 
 
 def explain_parts(parts: dict, templates: dict, min_score: float = DEFAULT_MIN_SCORE,
-                   min_margin: float = DEFAULT_MIN_MARGIN) -> str:
+                   min_margin: float = DEFAULT_MIN_MARGIN,
+                   rank_last_resort: bool = False) -> str:
     """辨識失敗時，說明「差在哪裡」。給 log 用，讓使用者知道要補什麼樣板。"""
     if not parts:
         return "切不出左上角（卡面位置可能沒對準）"
@@ -1006,6 +1049,9 @@ def explain_parts(parts: dict, templates: dict, min_score: float = DEFAULT_MIN_S
         why = ""
         if top[0][1] < min_score:
             why = f" ←分數未達 {min_score}"
+        elif rank_last_resort:
+            # 比大小的點數不會因為領先幅度被擋掉，別再叫使用者去看那個門檻。
+            why = ""
         elif len(top) > 1 and top[0][1] - top[1][1] < min_margin:
             why = f" ←領先不足 {min_margin}"
         bits.append(f"點數 {detail}{why}")
@@ -1037,12 +1083,15 @@ def recognize_by_corner(
     min_score: float = DEFAULT_MIN_SCORE,
     min_margin: float = DEFAULT_MIN_MARGIN,
     rect: Optional[tuple[int, int, int, int]] = None,
+    rank_last_resort: bool = False,
+    notes: Optional[list] = None,
 ) -> Optional[tuple[str, float]]:
     """一步到位：卡面 ROI -> ("10H", 分數)。"""
     parts = extract_parts(roi, expected_w, expected_h, rect=rect)
     if parts is None:
         return None
-    return classify_parts(parts, templates, min_score=min_score, min_margin=min_margin)
+    return classify_parts(parts, templates, min_score=min_score, min_margin=min_margin,
+                          rank_last_resort=rank_last_resort, notes=notes)
 
 
 def missing_parts(templates: dict) -> tuple[list[str], list[str]]:

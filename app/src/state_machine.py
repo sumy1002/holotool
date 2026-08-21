@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
+from .defaults_layout import BUNDLED_MARKER_HEIGHT, BUNDLED_MARKER_WIDTH
 from .geometry import content_height
 from .recognize import CardReader, marker_score, median_value
 
@@ -12,12 +13,22 @@ if TYPE_CHECKING:  # 只在型別檢查時需要；執行時不要 import，
 
 # 六個畫面標記各自的預設門檻。舊版全部共用 table_marker_threshold(0.80)，
 # 但它們的對比度、背景複雜度差很多，共用一個門檻一定會有人過不了、有人誤判。
+# draw_prompt 與 fail_marker 這兩個是 2026-08-21 換成原生解析度樣板時重新量的
+# （27 個實機畫面：1365 原生 21 張 + 1024 舊圖 6 張，正例最低分 vs 反例最高分）：
+#
+#   標記               正例最低  反例最高  舊門檻  新門檻
+#   draw_prompt          0.70     0.64    0.78 ✗   0.67
+#   fail_marker          0.81     0.77    0.82 ✗   0.79
+#
+# 這兩個框裡都有「會變的東西」：選牌提示是淡入淡出的，而且框內含大片背景漸層；
+# 失敗那格的大標題本身會變（失敗／無對子／一對…）。所以餘裕天生就小，
+# 不是解析度造成的。判斷「這一局結束了」請以 poker_fail_marker 為主（餘裕 0.45）。
 DEFAULT_MARKER_THRESHOLDS = {
     "table_marker": 0.82,
-    "draw_prompt": 0.78,
+    "draw_prompt": 0.67,
     "congrats_marker": 0.80,
     "challenge_marker": 0.80,
-    "fail_marker": 0.82,
+    "fail_marker": 0.79,
     "poker_fail_marker": 0.74,
     "max_win_marker": 0.78,
 }
@@ -116,8 +127,10 @@ def expected_marker_scale(cfg: dict, client_width: int,
             value = 0
         return value if value > 0 else fallback
 
-    ref_w = _int("capture_client_width", 1024)   # 內建預設樣板的來源解析度
-    ref_h = _int("capture_client_height", 438)
+    # 內建預設樣板的來源解析度。設定檔沒有這一項時退回內建常數 ——
+    # 寫死 1024 的話，升級內建樣板之後舊 config 會用錯倍率。
+    ref_w = _int("capture_client_width", BUNDLED_MARKER_WIDTH)
+    ref_h = _int("capture_client_height", BUNDLED_MARKER_HEIGHT)
 
     if client_width <= 0:
         return 1.0

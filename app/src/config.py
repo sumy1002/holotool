@@ -11,12 +11,21 @@ import os
 
 from . import profiles as profiles_mod
 from .defaults_layout import (
+    BUNDLED_MARKER_HEIGHT,
+    BUNDLED_MARKER_WIDTH,
     SCREENSHOT_CLIENT_HEIGHT,
     SCREENSHOT_CLIENT_WIDTH,
     SCREENSHOT_LAYOUT,
+    UI_MARKER_FILES,
 )
 from .geometry import is_ratio_value
-from .paths import config_path, ensure_runtime_dirs, install_default_ui_templates
+from .paths import (
+    config_path,
+    default_ui_dir,
+    ensure_runtime_dirs,
+    install_default_ui_templates,
+    resolve_data_path,
+)
 
 CONFIG_PATH = config_path()
 
@@ -29,7 +38,10 @@ CONFIG_PATH = config_path()
 #   5 = match_threshold 的預設改成 0.2。整張卡面比對只是備援路徑，門檻訂高
 #       等於讓備援永遠不生效；使用者要求過好幾次，但這一項原本沒放進
 #       RETUNED_ON_UPGRADE，所以他設定檔裡的 0.83 一直贏過新預設。
-CONFIG_VERSION = 5
+#   6 = 內建畫面標記樣板換成 1365x576 原生解析度（原本是 1024 縮圖再放大），
+#       draw_prompt 與 fail_marker 的門檻跟著重新量過。還在用內建樣板的人，
+#       `templates.capture_client_width` 也會一起同步（自己抓過樣板的人不動）。
+CONFIG_VERSION = 6
 
 # 升級到某個版本時，這些欄位要強制吃新的預設值。
 # 舊設定檔裡存著舊的調校數字，_deep_merge 會讓「使用者的舊值」蓋掉新預設，
@@ -38,6 +50,10 @@ CONFIG_VERSION = 5
 RETUNED_ON_UPGRADE = {
     3: ("part_min_score", "part_min_margin"),
     5: ("match_threshold",),
+    # 6 = 內建畫面標記樣板換成 1365x576 原生解析度（原本是 1024 縮圖放大），
+    #     兩個標記的門檻跟著重新量過。舊設定檔裡的 0.78 / 0.82 會讓
+    #     draw_prompt 與 fail_marker 永遠過不了門檻。
+    6: ("marker_thresholds",),
 }
 
 DEFAULT_CONFIG = {
@@ -79,12 +95,14 @@ DEFAULT_CONFIG = {
 
     # 六個畫面標記各自的比對門檻。它們的對比度與背景複雜度差很多，
     # 共用同一個門檻一定會有人過不了、有人誤判，所以拆開來調。
+    # ⚠️ 這一項在 config_version 6 被放進 RETUNED_ON_UPGRADE。理由見
+    # state_machine.DEFAULT_MARKER_THRESHOLDS 上面那段量測紀錄。
     "marker_thresholds": {
         "table_marker": 0.82,
-        "draw_prompt": 0.78,
+        "draw_prompt": 0.67,
         "congrats_marker": 0.80,
         "challenge_marker": 0.80,
-        "fail_marker": 0.82,
+        "fail_marker": 0.79,
         "poker_fail_marker": 0.74,
         "max_win_marker": 0.78,
     },
@@ -203,8 +221,8 @@ DEFAULT_CONFIG = {
         # 樣板是點陣圖，帶著擷取當下的解析度；實機視窗若不是這個寬度，
         # 比對前必須先把樣板縮放 (目前視窗寬 ÷ 這個值) 倍，否則一定對不起來。
         # 在「校準」分頁重新框選標記時，這個值會自動更新成當下的視窗寬度。
-        "capture_client_width": SCREENSHOT_CLIENT_WIDTH,
-        "capture_client_height": SCREENSHOT_CLIENT_HEIGHT,
+        "capture_client_width": BUNDLED_MARKER_WIDTH,
+        "capture_client_height": BUNDLED_MARKER_HEIGHT,
     },
 }
 
@@ -224,6 +242,7 @@ def load_config() -> dict:
     merged = _deep_merge(json.loads(json.dumps(DEFAULT_CONFIG)), cfg)
 
     retuned = _apply_retuning(merged, old_version)
+    resized = _sync_bundled_marker_size(merged) if old_version < 6 else False
 
     # 把舊設定檔的頂層 regions/points 搬進 profile。座標值一個都不改。
     migrated = profiles_mod.ensure_profiles(merged)
@@ -232,11 +251,14 @@ def load_config() -> dict:
         print(f"[設定升級] 校準資料已收進「{label}」這一組（座標未變動）。"
               "之後每種視窗長寬比可以各存一組，程式會依視窗當下的比例自動挑。")
 
-    if retuned or migrated:
+    if retuned or migrated or resized:
         merged["config_version"] = CONFIG_VERSION
         save_config(merged)
     if retuned:
         print(f"[設定升級] 已把重新調校過的參數換成新預設：{', '.join(retuned)}")
+    if resized:
+        print(f"[設定升級] 畫面標記樣板還是內建的那份，已把來源解析度更新成 "
+              f"{BUNDLED_MARKER_WIDTH}x{BUNDLED_MARKER_HEIGHT}（內建圖已換成原生解析度）。")
 
     legacy_fields = find_legacy_pixel_coords(merged)
     if legacy_fields:
@@ -246,6 +268,57 @@ def load_config() -> dict:
             "        新版改用比例座標，請重新執行 calibrate.py 校準，否則點擊位置會完全錯誤。"
         )
     return merged
+
+
+def _marker_image_paths(cfg: dict) -> dict:
+    """{內建檔名: card_templates 裡那份的絕對路徑}。"""
+    out = {}
+    for cfg_key, rel in (cfg.get("templates") or {}).items():
+        if not cfg_key.endswith("_image") or not isinstance(rel, str) or not rel:
+            continue
+        fname = os.path.basename(rel)
+        if fname in UI_MARKER_FILES.values():
+            out[fname] = resolve_data_path(rel)
+    return out
+
+
+def _same_bytes(a: str, b: str) -> bool:
+    try:
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            return fa.read() == fb.read()
+    except OSError:
+        return False
+
+
+def _sync_bundled_marker_size(cfg: dict) -> bool:
+    """使用者還在用內建標記樣板時，把「來源解析度」同步成內建的新解析度。
+
+    2026-08-21 把內建標記圖從 1024 縮圖換成 1365 原生截圖。設定檔裡的
+    `capture_client_width` 若還停在 1024，比對時會用錯倍率 ——
+    **換了樣板反而比原本更慘**。
+
+    但這一項**不能無條件覆蓋**：只要使用者自己在實機重新框選過標記，
+    那個數字就是他的截圖解析度，蓋掉等於把他的樣板全部縮放錯。
+    所以判斷方式是「card_templates 裡那幾張是不是內建的原封複本」，
+    而且**只比檔案內容、不比檔名** —— 比檔名這件事在點數/花色樣板上踩過：
+    內建檔名是 `suit_D_1..8`，使用者自己抓的也會被寫成那種名字，
+    於是「看起來像內建」的其實是他的成果，一比就把人家的東西當成內建處理。
+    """
+    bundled_dir = default_ui_dir()
+    pairs = _marker_image_paths(cfg)
+    present = [(name, path) for name, path in pairs.items() if os.path.exists(path)]
+    if not present:
+        return False
+    for name, path in present:
+        if not _same_bytes(path, os.path.join(bundled_dir, name)):
+            return False        # 有一張是他自己抓的 → 整組都不要動
+    templates = cfg.setdefault("templates", {})
+    if (templates.get("capture_client_width") == BUNDLED_MARKER_WIDTH
+            and templates.get("capture_client_height") == BUNDLED_MARKER_HEIGHT):
+        return False
+    templates["capture_client_width"] = BUNDLED_MARKER_WIDTH
+    templates["capture_client_height"] = BUNDLED_MARKER_HEIGHT
+    return True
 
 
 def _apply_retuning(cfg: dict, old_version: int) -> list[str]:
@@ -362,8 +435,8 @@ def apply_screenshot_layout(cfg: dict, *, install_templates: bool = True) -> dic
         install_default_ui_templates(overwrite=True)
         # 還原成內建預設樣板 = 樣板來源解析度也要跟著還原成 1024×438，
         # 否則比對時會用錯誤的倍率去縮放樣板。
-        cfg["templates"]["capture_client_width"] = SCREENSHOT_CLIENT_WIDTH
-        cfg["templates"]["capture_client_height"] = SCREENSHOT_CLIENT_HEIGHT
+        cfg["templates"]["capture_client_width"] = BUNDLED_MARKER_WIDTH
+        cfg["templates"]["capture_client_height"] = BUNDLED_MARKER_HEIGHT
     return cfg
 
 

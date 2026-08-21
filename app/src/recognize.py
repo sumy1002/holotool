@@ -262,6 +262,8 @@ class CardReader:
         self.min_margin = min_margin
         self.part_min_score = part_min_score
         self.part_min_margin = part_min_margin
+        # 比大小最後一次「領先不足但還是採用第一名」的說明，bot 會把它印到 log。
+        self.last_note: str = ""
 
     @property
     def has_parts(self) -> bool:
@@ -302,6 +304,37 @@ class CardReader:
             min_score=self.part_min_score, min_margin=self.part_min_margin,
         )
 
+    def explain_rightmost(self, strip, expected_w: int = 0, expected_h: int = 0) -> str:
+        """比大小的牌讀不到時說明原因。
+
+        為什麼一定要有這個：**比大小畫面沒有任何畫面標記**，它完全是靠
+        「讀到了那張牌」來判斷的。所以牌讀不到的時候，bot 會一路掉到 `_handle_idle`，
+        而使用者在 log 上只會看到「所有標記分數都沒過，看哪一項最接近門檻」——
+        那個建議在這個畫面上是**完全錯的方向**（沒有標記可以調）。
+        選牌畫面早就有 `_explain_missing_cards`，比大小這條路一直是全黑的。
+        """
+        if strip is None or getattr(strip, "size", 0) == 0:
+            return "擷取不到「比大小：目前已翻開的牌」這一塊（校準值可能是空的）"
+        if not self.has_parts:
+            return "沒有點數/花色樣板"
+        height, width = strip.shape[:2]
+        rect = cardparts.rightmost_card_rect(strip, expected_w or width,
+                                             expected_h or height)
+        if rect is None:
+            return (f"在這塊 {width}x{height} 的區域裡找不到白色卡身 —— "
+                    "校準框可能沒框到那張翻開的牌（框到牌背或背景了），"
+                    "或是遊戲視窗太小。到「校準」分頁重新框選"
+                    "『比大小：目前已翻開的牌』最快")
+        parts = cardparts.extract_parts(strip, expected_w or width,
+                                        expected_h or height, rect=rect)
+        if parts is None:
+            return f"找到卡身 {rect} 但切不出左上角（框可能只框到牌的一部分）"
+        return cardparts.explain_parts(
+            parts, self.part_templates,
+            min_score=self.part_min_score, min_margin=self.part_min_margin,
+            rank_last_resort=True,
+        )
+
     def read_rightmost(self, strip, expected_w: int, expected_h: int):
         """比大小畫面：在一條水平長條裡讀出「最右邊那張完整露出的牌」。
 
@@ -310,19 +343,26 @@ class CardReader:
         的牌**，所以取最右邊的白色卡身區塊，而不是面積最大的那塊 —— 剛翻開的
         那一張是單獨一塊，面積往往比左邊那一整排小。蓋著的牌是紫色的卡背，
         不是白的，不會被選到。
+
+        比大小這條路對「認不出來」的容忍度跟選牌畫面不一樣：這個畫面沒有任何
+        畫面標記，讀不到牌就整個流程停住（使用者實際遇到的就是這個）。所以點數
+        只差一點領先幅度時採用第一名 —— 詳見 `cardparts.classify_parts` 的說明。
         """
+        self.last_note = ""
         if strip is None or getattr(strip, "size", 0) == 0:
             return None
         rect = cardparts.rightmost_card_rect(strip, expected_w, expected_h)
         if rect is None:
             return None
         if self.has_parts:
+            notes: list = []
             hit = cardparts.recognize_by_corner(
                 strip, self.part_templates, expected_w, expected_h,
                 min_score=self.part_min_score, min_margin=self.part_min_margin,
-                rect=rect,
+                rect=rect, rank_last_resort=True, notes=notes,
             )
             if hit is not None:
+                self.last_note = notes[0] if notes else ""
                 return hit
         if self.has_cards:
             x, y, w, h = rect
