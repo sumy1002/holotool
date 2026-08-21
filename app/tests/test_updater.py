@@ -15,6 +15,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 from unittest.mock import patch
 
@@ -366,11 +367,209 @@ class TestApplyScript(unittest.TestCase):
             self.assertIn("HoloTool.exe", body)
             self.assertIn("start", body)
 
+    def test_a_failed_copy_still_brings_the_app_back(self):
+        """複製失敗時**一定**要把舊版重新開起來。
+
+        實機回報（2026-08-21，另一台電腦）：按下更新之後 HoloTool 關掉，
+        然後就再也沒有出現，工作管理員裡也沒有任何東西 —— 使用者完全不知道
+        發生了什麼事。原因是那條失敗路徑只印一行字、等五秒、然後把自己刪掉，
+        **從來不會把程式叫回來**。而 HoloTool 在那個時間點早就關掉了。
+
+        複製失敗時安裝目錄可能已經被改了一半，但「開起來看看」永遠比
+        「什麼都沒有」好 —— 而且真正沒被動到的使用者資料才是重點。
+        """
+        lines = self._script(tempfile.mkdtemp()).splitlines()
+        fail = next(i for i, line in enumerate(lines)
+                    if "update incomplete" in line)
+        finish = next(i for i, line in enumerate(lines)
+                      if line.strip() == ":finish")
+        restore = next(i for i, line in enumerate(lines)
+                       if line.strip() == ":restore")
+        # 失敗分支跳到 :restore，而 :restore 會 start 回去
+        self.assertTrue(any("goto restore" in line for line in lines[fail:fail + 4]))
+        self.assertLess(restore, finish)
+        self.assertTrue(any(line.strip().startswith("start ")
+                            for line in lines[restore:finish]),
+                        "失敗路徑沒有把 HoloTool 重新開起來")
+
+    def test_the_success_path_does_not_fall_through_into_restore(self):
+        """成功之後要 goto finish，不然會再 start 一次 = 開兩個 HoloTool。"""
+        lines = self._script(tempfile.mkdtemp()).splitlines()
+        ok = next(i for i, line in enumerate(lines)
+                  if "Restarting HoloTool" in line)
+        restore = next(i for i, line in enumerate(lines)
+                       if line.strip() == ":restore")
+        self.assertTrue(any(line.strip() == "goto finish"
+                            for line in lines[ok:restore]))
+
+    def test_the_give_up_branch_does_not_start_a_second_instance(self):
+        """關不掉才走放棄那條 —— 那表示 HoloTool 還活著，不可以再開一個。"""
+        lines = self._script(tempfile.mkdtemp()).splitlines()
+        give_up = next(i for i, line in enumerate(lines)
+                       if "aborting, nothing changed" in line)
+        copy = next(i for i, line in enumerate(lines)
+                    if line.strip().startswith("robocopy"))
+        self.assertFalse(any(line.strip().startswith("start ")
+                             for line in lines[give_up:copy]))
+
     def test_script_is_pure_ascii(self):
         """cmd 預設不是 UTF-8，帶中文的批次檔在某些機器上會整行解析失敗。"""
         with tempfile.TemporaryDirectory() as tmp:
             body = self._script(tmp)
             body.encode("ascii")   # 不該丟例外
+
+
+class TestLaunchFlags(unittest.TestCase):
+    """置換腳本必須比主程式活得久。
+
+    ## 實機事故（2026-08-21，`D:\\HoloTool` 那台）
+
+    `update.log` 只有最前面三行標頭，**連等待迴圈的第一拍都沒寫到**，
+    也沒有結尾的 `==== done ====`。主程式 log 顯示 22:37:36 啟動腳本，
+    而腳本標頭的時間戳也是 22:37:36 —— 腳本活了大概幾十毫秒，
+    正好就是主程式 `os._exit()` 之前的那一小段。
+
+    最合理的解釋：主程式被放在一個 `KILL_ON_JOB_CLOSE` 的 job 物件裡
+    （某些啟動器、防毒、遠端桌面工作階段都會這樣做），子行程預設繼承那個 job，
+    主程式一死子行程就跟著被殺，而且完全沒有錯誤訊息。
+    解法是 `CREATE_BREAKAWAY_FROM_JOB`。
+
+    順帶修掉另一件事：原本用的 `DETACHED_PROCESS` 是**完全沒有 console**，
+    不是「開一個新的」—— 所以對話框說的「畫面會閃一下命令列視窗」從來沒有
+    兌現過，腳本裡每一行沒有導向檔案的 `echo` 也全部丟進虛空。
+    要看得見的視窗得用 `CREATE_NEW_CONSOLE`。
+    """
+
+    def test_the_first_attempt_breaks_away_from_the_job(self):
+        name, flags = updater.LAUNCH_FLAG_ATTEMPTS[0]
+        self.assertTrue(flags & 0x01000000, "第一順位必須帶 CREATE_BREAKAWAY_FROM_JOB")
+        self.assertTrue(flags & 0x00000010, "同時要開一個看得見的 console")
+
+    def test_detached_is_only_the_last_resort(self):
+        """DETACHED_PROCESS = 沒有 console，只能當最後的退路。"""
+        names = [n for n, _f in updater.LAUNCH_FLAG_ATTEMPTS]
+        self.assertEqual(names[-1], "detached")
+        for _name, flags in updater.LAUNCH_FLAG_ATTEMPTS[:-1]:
+            self.assertFalse(flags & 0x00000008)
+
+    def test_it_falls_back_when_the_job_refuses_breakaway(self):
+        """job 不給脫離時 CreateProcess 會回 ACCESS_DENIED —— 要有退路。"""
+        calls = []
+
+        def fake_popen(cmd, **kwargs):
+            calls.append(kwargs.get("creationflags"))
+            if len(calls) == 1:
+                raise OSError(5, "Access is denied")
+            return object()
+
+        with mock.patch.object(updater.os, "name", "nt"), \
+                mock.patch.object(updater.subprocess, "Popen", fake_popen):
+            updater.launch_apply_script("C:\\tmp\\x.bat")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1], updater.LAUNCH_FLAG_ATTEMPTS[1][1])
+
+    def test_a_total_failure_is_raised_not_swallowed(self):
+        """一種都啟動不了時**必須**丟例外 —— GUI 才不會把自己關掉。
+
+        吞掉例外的後果就是：程式關了、腳本沒跑、桌面上什麼都沒有。
+        """
+        def always_fail(cmd, **kwargs):
+            raise OSError(5, "Access is denied")
+
+        with mock.patch.object(updater.os, "name", "nt"), \
+                mock.patch.object(updater.subprocess, "Popen", always_fail):
+            with self.assertRaises(updater.UpdateError):
+                updater.launch_apply_script("C:\\tmp\\x.bat")
+
+
+class TestWaitLoopIsObservable(unittest.TestCase):
+    """等待迴圈每一拍都要留下紀錄。
+
+    出事那次的 log 停在標頭，於是「跑了 0 拍」跟「跑了 34 拍」長得一模一樣，
+    完全無法判斷是腳本沒動、還是主程式關不掉。這種資訊落差不能再有一次。
+    """
+
+    def _script(self, tmp: str) -> str:
+        root = os.path.join(tmp, "root")
+        stage = os.path.join(tmp, "stage")
+        os.makedirs(root, exist_ok=True)
+        os.makedirs(stage, exist_ok=True)
+        path = updater.write_apply_script(stage, root, zip_path="", pid=4242,
+                                          script_dir=tmp)
+        with open(path, encoding="ascii") as f:
+            return f.read()
+
+    def test_every_tick_is_logged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lines = self._script(tmp).splitlines()
+            loop = next(i for i, line in enumerate(lines)
+                        if line.strip() == ":waitloop")
+            copy = next(i for i, line in enumerate(lines)
+                        if line.strip().startswith("robocopy"))
+            body = "\n".join(lines[loop:copy])
+            self.assertIn("%LOGFILE%", body, "等待迴圈裡完全沒有寫 log")
+            self.assertIn("tick %tries%", body)
+
+    def test_entering_the_loop_and_the_copy_are_both_logged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            body = self._script(tmp)
+            self.assertIn("[STEP] waiting for pid", body)
+            self.assertIn("[STEP] copying program files", body)
+
+
+class TestRootWritableCheck(unittest.TestCase):
+    """更新前就要發現「寫不進安裝目錄」，不能等到程式關掉之後才發現。
+
+    真正複製檔案的是那支批次檔，而它在 HoloTool **關掉之後**才動手。
+    等 robocopy 拿到 exit code 16（存取被拒，最常見的原因是裝在
+    `C:\\Program Files`）才失敗，使用者已經面對一個空桌面了。
+    """
+
+    def test_a_writable_folder_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            updater.assert_root_writable(tmp)          # 不該丟例外
+            self.assertEqual(os.listdir(tmp), [], "探測檔沒有清乾淨")
+
+    def test_the_app_subfolder_is_checked_too(self):
+        """批次檔也會寫 app\\ 底下，所以那裡也要能寫。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            inner = os.path.join(tmp, "app")
+            os.makedirs(inner)
+            updater.assert_root_writable(tmp)
+            self.assertEqual(os.listdir(inner), [])
+
+    def test_an_unwritable_folder_is_refused_with_a_useful_message(self):
+        """用「不存在的資料夾」當替身 —— 一樣是 OSError，而且到處都測得到
+        （唯讀資料夾那條在 Windows 和 root 底下都會被跳過）。"""
+        missing = os.path.join(tempfile.gettempdir(), "holotool-no-such-dir-xyz")
+        self.assertFalse(os.path.isdir(missing))
+        with self.assertRaises(updater.UpdateError) as ctx:
+            updater.assert_root_writable(missing)
+        message = str(ctx.exception)
+        self.assertIn("沒有權限", message)
+        self.assertIn("Program Files", message)   # 講出最常見的原因
+        self.assertIn("什麼都還沒動", message)     # 讓人知道現在是安全的
+
+    def test_a_read_only_folder_is_refused_too(self):
+        if os.name == "nt" or os.geteuid() == 0:
+            self.skipTest("需要非 root 的 POSIX 權限才測得到唯讀資料夾")
+        with tempfile.TemporaryDirectory() as tmp:
+            locked = os.path.join(tmp, "locked")
+            os.makedirs(locked)
+            os.chmod(locked, 0o500)
+            try:
+                with self.assertRaises(updater.UpdateError) as ctx:
+                    updater.assert_root_writable(locked)
+            finally:
+                os.chmod(locked, 0o700)
+            self.assertIn("沒有權限", str(ctx.exception))
+
+    def test_it_runs_before_anything_is_downloaded(self):
+        """順序很重要：這一關要排在下載一百多 MB 之前。"""
+        import inspect
+        body = inspect.getsource(updater.prepare_update)
+        self.assertLess(body.index("assert_root_writable"),
+                        body.index("download_release"))
 
 
 class TestHardExit(unittest.TestCase):

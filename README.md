@@ -1026,6 +1026,42 @@ app\.venv\Scripts\python.exe app\tools\check_markers.py app\debug_captures    # 
   直接關掉那個視窗，再到工作管理員確認沒有殘留的 `HoloTool.exe` 就好。
   這個情形在 1.0.1 之後修掉了（程式端強制結束行程、腳本端等不到就 taskkill）。
 
+- **按下更新之後 HoloTool 關掉，然後就再也沒有出現**（工作管理員裡也沒有）：
+  複製那一步失敗了，而**舊版的置換腳本在失敗時不會把程式叫回來** ——
+  所以畫面上什麼都不剩，看起來像整個消失。
+
+  1. 先直接雙擊 `HoloTool.exe`，多半打得開（你的校準與樣板一定沒被動到，
+     那幾個資料夾在三層防護裡）。
+  2. 看 `app\logs\update.log` 最後一段：`robocopy exit code 16` 就是
+     **沒有寫入權限**，最常見的原因是裝在 `C:\Program Files` 底下。
+  3. 打不開的話到 Release 頁面下載 zip，手動解壓覆蓋安裝資料夾即可
+     （zip 裡不含 `config\`、`card_templates\`，覆蓋不會蓋掉你的東西）。
+
+  1.0.18 之後三邊都補起來了：
+
+  * **更新前**先實際在安裝資料夾寫一個探測檔，寫不進去就在**還沒關掉程式**的
+    時候擋下來並說明原因。
+  * 置換腳本**複製失敗時會把舊版重新開起來**，不會再留一個空桌面。
+  * 啟動腳本改用 `CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_CONSOLE`（見下一條）。
+
+- **`update.log` 只有最前面那幾行標頭，連 `==== done ====` 都沒有**：
+  腳本被**連坐殺掉**了。主程式如果被放在一個 `KILL_ON_JOB_CLOSE` 的 job 物件裡
+  （某些啟動器、防毒、遠端桌面工作階段都會這樣做），子行程預設會繼承那個 job，
+  主程式 `os._exit()` 的瞬間腳本就跟著死，而且**完全沒有錯誤訊息**。
+
+  1.0.18 起啟動旗標改成
+  `CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP`，
+  job 不給脫離時再退成單純的新視窗、最後才退回舊的 `DETACHED_PROCESS`，
+  而且會把實際用到的那一種寫進主程式的 log（`[更新] 置換腳本已啟動（…）`）。
+
+  > 順帶更正一個一直寫錯的註解：`DETACHED_PROCESS` 是**完全沒有 console**，
+  > 不是「開一個新的」。所以對話框說的「畫面會閃一下命令列視窗」以前從來沒有
+  > 兌現過，腳本裡沒有導向檔案的 `echo` 也全部丟進虛空 —— 要看得見的視窗
+  > 得用 `CREATE_NEW_CONSOLE`。
+
+  等待迴圈現在**每一拍都寫一行 log**（`[WAIT] tick n`），所以下次真的再出事，
+  「腳本沒動」跟「主程式關不掉」一眼就分得出來。
+
 - **更新按完重開，版本還是舊的**：看 `app\logs\update.log`。
   常見兩種：`pid ... would not exit`（主程式關不掉 —— 通常是還有另一個
   HoloTool 視窗開著）、`robocopy exit code ...`（安裝目錄沒有寫入權限，

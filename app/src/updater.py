@@ -40,7 +40,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 
-from .paths import log_dir, project_root
+from .paths import BUNDLE_SUBDIR, log_dir, project_root
 from .version import (
     __version__,
     asset_name,
@@ -488,6 +488,44 @@ def install_root() -> str:
     return os.path.dirname(os.path.abspath(sys.executable))
 
 
+def assert_root_writable(root: str) -> None:
+    """更新前先確認安裝目錄真的寫得進去，寫不進去就**在關掉程式之前**放棄。
+
+    為什麼一定要有這一關：真正把檔案複製進安裝目錄的是那支批次檔，而它是在
+    HoloTool **已經關掉之後**才動手的。等到那時候才發現沒有權限，使用者看到的
+    就是「程式關掉了、然後什麼都沒發生」—— 沒有視窗、工作管理員裡也沒有東西，
+    完全不知道出了什麼事（實機回報過一次）。
+
+    最常見的原因是裝在 `C:\\Program Files` 底下：那裡沒有提權就是寫不進去，
+    robocopy 會拿到 exit code 16，而那時候已經太晚了。
+
+    這裡只做一件事：在安裝目錄（以及 `app\\` 子目錄，批次檔也會寫那裡）建一個
+    小檔案再刪掉。做得到就代表 robocopy 也做得到。
+    """
+    targets = [root]
+    inner = os.path.join(root, BUNDLE_SUBDIR)
+    if os.path.isdir(inner):
+        targets.append(inner)
+    for folder in targets:
+        probe = os.path.join(folder, ".holotool-write-test")
+        try:
+            with open(probe, "w", encoding="ascii") as f:
+                f.write("ok")
+        except OSError as exc:
+            raise UpdateError(
+                f"沒有權限寫入安裝資料夾，這次更新不能進行：\n{folder}\n\n"
+                f"（{exc.__class__.__name__}: {exc}）\n\n"
+                "自動更新是靠一支批次檔把新檔案複製進安裝資料夾，寫不進去就沒辦法\n"
+                "更新。常見原因與解法：\n"
+                "• 裝在 C:\\Program Files 底下 —— 用「以系統管理員身分執行」開啟 "
+                "HoloTool 再更新一次，或到 Release 頁面下載安裝檔重裝\n"
+                "• 防毒軟體鎖住了資料夾 —— 把安裝資料夾加進白名單\n\n"
+                "現在什麼都還沒動，程式可以繼續正常使用。"
+            ) from exc
+        finally:
+            _silent_remove(probe)
+
+
 APPLY_SCRIPT_NAME = "holotool_apply_update.bat"
 
 # 等主程式結束的節奏：先客氣地等，等不到就強制結束。
@@ -513,6 +551,7 @@ set "ZIPFILE={zipfile}"
 echo ==== HoloTool update %DATE% %TIME% ==== >> "%LOGFILE%"
 echo root=%ROOT% >> "%LOGFILE%"
 echo stage=%STAGE% >> "%LOGFILE%"
+echo pid=%PID% >> "%LOGFILE%"
 
 echo.
 echo   HoloTool is updating. This window closes by itself.
@@ -522,11 +561,13 @@ echo.
 rem --- 1. wait for the running HoloTool.exe to exit ---
 rem     Graceful first; force-kill if it will not go away. The copy step
 rem     cannot start while the exe is still holding its own file open.
+echo [STEP] waiting for pid %PID% to exit >> "%LOGFILE%"
 set /a tries=0
 :waitloop
 tasklist /NH /FI "PID eq %PID%" 2>nul | find "%PID%" >nul
 if errorlevel 1 goto replace
 set /a tries+=1
+echo [WAIT] tick %tries% - pid %PID% still running >> "%LOGFILE%"
 if %tries%=={kill_after} (
   echo   Still closing...
   echo [WARN] pid %PID% alive after {kill_after}s - forcing it to close >> "%LOGFILE%"
@@ -542,16 +583,18 @@ ping -n 2 127.0.0.1 >nul
 goto waitloop
 
 rem --- 2. copy program files over the install dir ---
+rem     Every branch from here on writes to the log. If the log ever stops
+rem     mid-way again we will know exactly which line it died on.
 rem     No /PURGE: we never delete anything the user owns.
 rem     /XD excludes the user data dirs as a third safety net.
 :replace
+echo [STEP] copying program files >> "%LOGFILE%"
 echo   Replacing program files...
 robocopy "%STAGE%" "%ROOT%" /E /R:3 /W:1 /NFL /NDL /NJH /NJS{excludes} >> "%LOGFILE%" 2>&1
 if errorlevel 8 (
   echo [ERROR] robocopy exit code %ERRORLEVEL% - update incomplete >> "%LOGFILE%"
   echo   Copy failed. See the log above. Your settings were not touched.
-  ping -n 6 127.0.0.1 >nul
-  goto finish
+  goto restore
 )
 echo [OK] program files replaced >> "%LOGFILE%"
 
@@ -560,6 +603,18 @@ rmdir /S /Q "%STAGE%" 2>nul
 if exist "%ZIPFILE%" del /F /Q "%ZIPFILE%" 2>nul
 echo   Restarting HoloTool...
 start "" "%ROOT%\\{sentinel}"
+goto finish
+
+rem --- the copy failed: never leave the user with nothing running ---
+rem     HoloTool is already closed by this point, so just exiting here leaves
+rem     the user staring at an empty desktop with no window and nothing in
+rem     Task Manager - exactly what one machine reported. Bring the app back.
+:restore
+echo [INFO] update did not complete - restarting the previous version >> "%LOGFILE%"
+echo   Restarting the previous version. Nothing was lost.
+echo   Log: %LOGFILE%
+start "" "%ROOT%\\{sentinel}"
+ping -n 11 127.0.0.1 >nul
 
 :finish
 echo ==== done %DATE% %TIME% ==== >> "%LOGFILE%"
@@ -605,25 +660,64 @@ def write_apply_script(staging: str, root: str, zip_path: str = "",
     return path
 
 
+# 啟動置換腳本要用的 CreateProcess 旗標，**依序**嘗試，第一個成功的就用。
+#
+# 為什麼要這麼講究：這支腳本的工作就是「在主程式死掉之後才動手」，
+# 所以它必須比主程式活得久。2026-08-21 有一台電腦（D:\HoloTool）就是敗在這裡 ——
+# `update.log` 只有最前面三行標頭，連等待迴圈的第一拍都沒寫到，也沒有結尾的
+# `==== done ====`。腳本在主程式 `os._exit()` 之後大約 50 毫秒就整個消失了。
+#
+# | 旗標 | 作用 |
+# |---|---|
+# | `CREATE_BREAKAWAY_FROM_JOB` | **關鍵。** 主程式若被放在一個帶 `KILL_ON_JOB_CLOSE` 的 job 物件裡（某些啟動器、防毒、遠端桌面工作階段都會這樣做），子行程預設會繼承那個 job —— 主程式一結束，子行程**跟著被殺掉**，而且沒有任何錯誤訊息。這個旗標讓它脫離。 |
+# | `CREATE_NEW_CONSOLE` | 真的開一個看得見的視窗。**原本用的 `DETACHED_PROCESS` 是「完全沒有 console」**，不是「開一個新的」—— 所以那句「畫面會閃一下命令列視窗」從來沒有兌現過，腳本裡每一行沒有導向檔案的 `echo` 也全部丟進虛空。 |
+# | `CREATE_NEW_PROCESS_GROUP` | 不要跟著主程式收到 Ctrl+C／關閉事件。 |
+#
+# job 不允許脫離時 `CreateProcess` 會回 ACCESS_DENIED，所以要有退路：
+# 先試「脫離 job」，失敗就退成單純的新視窗，再失敗才退回舊的做法。
+_CREATE_NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+_CREATE_NEW_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+_CREATE_BREAKAWAY = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+_DETACHED = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+
+LAUNCH_FLAG_ATTEMPTS = (
+    ("breakaway+console", _CREATE_BREAKAWAY | _CREATE_NEW_CONSOLE | _CREATE_NEW_GROUP),
+    ("console", _CREATE_NEW_CONSOLE | _CREATE_NEW_GROUP),
+    ("detached", _DETACHED | _CREATE_NEW_GROUP),
+)
+
+
 def launch_apply_script(script: str) -> None:
     """把 .bat 丟出去背景執行，然後就該讓主程式**立刻**結束了。
 
-    用 DETACHED_PROCESS 讓它脫離本行程 —— 否則主程式一結束，
-    子行程可能跟著被收掉，更新做一半。
+    旗標的選擇與理由見上面 `LAUNCH_FLAG_ATTEMPTS` 那張表 —— 那不是可有可無的
+    調校，是「腳本會不會跟著主程式一起被殺掉」的關鍵。
 
-    刻意**不加** CREATE_NO_WINDOW：這支腳本會在畫面上待十來秒，
-    有個視窗寫著「正在更新，這個視窗會自己關掉」比一片空白安心得多，
-    出問題時也看得到最後那行錯誤訊息。
+    **不吞例外**：三種方式都啟動不了就丟 `UpdateError`，讓 GUI 顯示錯誤而且
+    **不要關閉程式**。腳本沒跑起來卻把自己關掉，使用者會得到一個空桌面。
     """
-    creationflags = 0
-    if os.name == "nt":
-        creationflags = (getattr(subprocess, "DETACHED_PROCESS", 0)
-                         | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
-    subprocess.Popen(  # noqa: S603  （路徑是我們自己產生的）
-        ["cmd", "/c", script],
-        cwd=tempfile.gettempdir(),
-        creationflags=creationflags,
-        close_fds=True,
+    if os.name != "nt":
+        subprocess.Popen(  # noqa: S603  （路徑是我們自己產生的）
+            ["cmd", "/c", script], cwd=tempfile.gettempdir(), close_fds=True)
+        return
+
+    problems: list[str] = []
+    for name, flags in LAUNCH_FLAG_ATTEMPTS:
+        try:
+            subprocess.Popen(  # noqa: S603
+                ["cmd", "/c", script],
+                cwd=tempfile.gettempdir(),
+                creationflags=flags,
+                close_fds=True,
+            )
+        except OSError as exc:
+            problems.append(f"{name}: {exc!r}")
+            continue
+        _log(f"[更新] 置換腳本已啟動（{name}）")
+        return
+    raise UpdateError(
+        "啟動更新程式失敗，這次更新不會進行（程式沒有被關掉，可以繼續用）：\n"
+        + "\n".join(problems)
     )
 
 
@@ -660,6 +754,10 @@ def prepare_update(release: ReleaseInfo, progress=None) -> dict:
     整個流程可以在背景執行緒跑（沒有碰任何 tkinter 元件）。
     """
     root = install_root()          # 開發模式會在這裡就被擋下來
+    # **在下載一百多 MB、也在關掉程式之前**先確認安裝目錄寫得進去。
+    # 這一關失敗的代價只是一個對話框；等批次檔跑到 robocopy 才發現，
+    # 使用者已經對著一個空桌面了。
+    assert_root_writable(root)
     work = staging_root()
     parent = os.path.dirname(work)
 
