@@ -11,7 +11,7 @@ from .geometry import aspect_ratio_delta, scale_factor
 from .handeval import Card, classify_hand, hand_name
 from .logger import log
 from .paths import resolve_data_path
-from .cardparts import RANKS, SUITS, missing_parts
+from .cardparts import MIN_PART_COVERAGE, RANKS, SUITS, missing_parts, unusable_parts
 from .recognize import (
     CardReader,
     load_card_templates,
@@ -89,6 +89,26 @@ class Bot:
             part_min_margin=self.cfg.get("part_min_margin", 0.05),
         )
 
+    def _report_unusable_parts(self) -> None:
+        """開始前提醒：哪些樣板檔裁壞了、不會被拿來比對。
+
+        載入時是安靜跳過的（使用者的檔案一律不刪），不講的話他永遠不知道
+        自己在「校準還沒對上這個長寬比」的狀態下存了幾個廢檔。
+        """
+        try:
+            from .paths import parts_dir
+            bad = unusable_parts(parts_dir())
+        except Exception:
+            return
+        if not bad:
+            return
+        names = "、".join(f"{n}({c})" for n, c in bad[:8])
+        log(f"[樣板] 有 {len(bad)} 個樣板檔裁壞了（圖案只佔畫布不到 "
+            f"{MIN_PART_COVERAGE:.0%}，等於一個小點），已略過不用：{names}"
+            f"{' …' if len(bad) > 8 else ''}")
+        log("        通常是「校準還沒對上目前的長寬比」時按了儲存，"
+            "角落只切到花色的一小角。到「點數/花色樣板」分頁刪掉再重抓即可。")
+
     def _report_part_sources(self) -> None:
         """開始前提醒：哪些點數／花色還在用內建（比較糊）的樣板。"""
         try:
@@ -147,6 +167,7 @@ class Bot:
                     "缺的那些牌會辨識失敗，可到「點數/花色樣板」分頁補齊。"
                 )
             self._report_part_sources()
+            self._report_unusable_parts()
             limit = int(self.cfg.get("daily_max_wins", 2))
             done = self._max_win_count()
             log(f"今日已達最高獲得金額 {done}/{limit} 次"

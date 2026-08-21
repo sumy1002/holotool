@@ -54,6 +54,44 @@ class Card:
         return Card(rank, suit)
 
 
+# 全形英數的起點（中文輸入法打出來的常常是全形）
+_FULLWIDTH_RANGES = (
+    (0xFF10, 0xFF19, ord("0")),   # ０-９
+    (0xFF21, 0xFF3A, ord("A")),   # Ａ-Ｚ
+    (0xFF41, 0xFF5A, ord("A")),   # ａ-ｚ（順便轉大寫）
+)
+
+# 最長的有效代號是 "JOKER"
+LABEL_INPUT_MAX_LEN = 5
+
+
+def normalize_label_input(text: str, max_len: int = LABEL_INPUT_MAX_LEN) -> str:
+    """把使用者打進輸入框的東西整理成合法的牌面代號字元。
+
+    只留 ASCII 英數字、一律轉大寫、全形折成半角、截到 `max_len`。
+
+    為什麼需要：「點數/花色樣板」那六個代號欄，每次按完「讀取目前畫面」，
+    Windows 就把輸入法切回中文 —— 焦點一移動，剛剛用 Shift 切成英文的狀態
+    不會跟著走。使用者打 "10h" 實際進來的是一串中文，或是全形的 "１０Ｈ"，
+    存檔時只看到一句「格式不對」，完全看不出是輸入法造成的。
+
+    大小寫沒差：`Card.from_label` 本來就會 upper()，這裡提前做掉，
+    讓使用者在畫面上就看到自己打的東西被接受成什麼樣子。
+    """
+    out: list[str] = []
+    for ch in text:
+        code = ord(ch)
+        for start, end, base in _FULLWIDTH_RANGES:
+            if start <= code <= end:
+                ch = chr(code - start + base)
+                break
+        if ch.isascii() and ch.isalnum():
+            out.append(ch.upper())
+            if len(out) >= max_len:
+                break
+    return "".join(out)
+
+
 def rank_value(rank: str) -> int:
     if rank == "JK":
         return 0

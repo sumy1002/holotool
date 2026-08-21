@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
 from typing import Optional
 
@@ -176,6 +177,48 @@ def centre_mask(img: np.ndarray) -> np.ndarray:
                   int(round((h - 1) / 2.0 - ys.mean())))
 
 
+# 點數小圖去雜點的門檻：面積小於「最大連通塊的這個比例」就丟掉。
+#
+# 為什麼只對點數做：角落的點數與花色是靠橫向投影切開的，切點不可能每次都完美，
+# 常常把花色符號的一小角留在點數那一塊裡（實機樣板 rank_2_5、rank_3_5、rank_8_2
+# 底下都看得到那顆小點）。質心置中會被那顆小點拉偏，整個字就歪掉。
+#
+# 花色與中央大圖案**不做**：梅花本身就是三個瓣、有些花色正規化後會斷成幾塊，
+# 實測門檻拉到 10% 以上就開始把真正的花色瓣切掉（suit_H_9 被誤判成 D）。
+#
+# 「10」是兩塊（1 和 0），所以不能只留最大塊，要用比例。
+# 實測 3%~12% 之間結果完全一樣（點數 59/62 → 60/62），取中間值。
+RANK_SPECK_AREA_FRAC = 0.08
+
+
+def drop_specks(mask: np.ndarray, min_area_frac: float) -> np.ndarray:
+    """丟掉「明顯比主體小」的獨立小塊。全空或只有一塊時原樣回傳。"""
+    if mask is None or mask.size == 0:
+        return mask
+    binary = (mask > 127).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    if count <= 2:
+        return mask
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    if len(areas) == 0:
+        return mask
+    biggest = int(areas.max())
+    keep = np.zeros_like(binary)
+    for index, area in enumerate(areas, start=1):
+        if area >= biggest * min_area_frac:
+            keep[labels == index] = 1
+    if keep.sum() == 0:
+        return mask
+    return keep * 255
+
+
+def clean_part_mask(mask: np.ndarray, kind: str) -> np.ndarray:
+    """依種類做該做的清理。目前只有點數需要去雜點。"""
+    if kind == "rank":
+        return drop_specks(mask, RANK_SPECK_AREA_FRAC)
+    return mask
+
+
 def _normalize(mask: np.ndarray, size: tuple[int, int]) -> Optional[np.ndarray]:
     """裁緊後等比例放進固定畫布，回傳 0/255 的灰階小圖。"""
     tight = _tight(mask)
@@ -308,7 +351,7 @@ def extract_parts(
     if rank_mask.sum() < 6 or suit_mask.sum() < 4:
         return None
 
-    rank_img = _normalize(rank_mask, RANK_SIZE)
+    rank_img = _normalize(clean_part_mask(rank_mask, "rank"), RANK_SIZE)
     suit_img = _normalize(suit_mask, SUIT_SIZE)
     if rank_img is None or suit_img is None:
         return None
@@ -361,7 +404,7 @@ def _extract_bottom_corner(roi: np.ndarray, rect, ref_w: int, ref_h: int):
     suit_mask = _ink_mask(suit_rgb)
     if rank_mask.sum() < 6 or suit_mask.sum() < 4:
         return None
-    rank_img = _normalize(rank_mask, RANK_SIZE)
+    rank_img = _normalize(clean_part_mask(rank_mask, "rank"), RANK_SIZE)
     suit_img = _normalize(suit_mask, SUIT_SIZE)
     if rank_img is None or suit_img is None:
         return None
@@ -475,26 +518,137 @@ def parse_part_name(fname: str):
     return bits[0], bits[1].upper()
 
 
+# 一個「有用的」樣板，圖案至少要佔畫布這麼大的比例（外框面積 / 畫布面積）。
+#
+# 2026-08-21 量了實機上 35 個花色樣板，分佈完全分離：
+#     垃圾 4 個： 0.097 ~ 0.111   ← 只有一個 8x7 的小點
+#     正常 31 個：0.312 ~ 0.694
+# 中間空一大段，0.22 放在中間非常安全。
+#
+# 那 4 個垃圾是使用者在「校準還沒對上這個長寬比」的狀態下按儲存留下來的：
+# 角落裁切框沒對準，只切到花色符號的一小角，正規化之後就變成一個小圓點。
+# 小圓點跟任何圓形花色都有點像，於是把整組比對拖下水 ——
+# 實測整體正確率從 ≥75% 掉到 66.7%（36/54），而且症狀是「一直認不出來」。
+MIN_PART_COVERAGE = 0.22
+
+
+def part_coverage(img) -> float:
+    """圖案的外框佔整張畫布的比例（0~1）。全空回 0。"""
+    if img is None or getattr(img, "size", 0) == 0:
+        return 0.0
+    mask = img > 127 if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) > 127
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return 0.0
+    box = (xs.max() - xs.min() + 1) * (ys.max() - ys.min() + 1)
+    return float(box) / float(mask.shape[0] * mask.shape[1])
+
+
+def part_is_usable(img, min_coverage: float = MIN_PART_COVERAGE) -> bool:
+    """這張樣板夠不夠格拿來比對。
+
+    擋的是「裁切框沒對準，只切到符號一角」留下來的小點。這種檔案不會報錯、
+    看起來也像個正常的樣板檔，但會把同標籤的比對整組拖下水。
+    """
+    return part_coverage(img) >= min_coverage
+
+
+def bundled_fingerprints(bundled_dir: Optional[str]) -> dict:
+    """內建樣板的「檔名 → 內容雜湊」。用來判斷 parts/ 裡哪一個還是內建的。"""
+    out: dict = {}
+    if not bundled_dir or not os.path.isdir(bundled_dir):
+        return out
+    for name in os.listdir(bundled_dir):
+        if not name.lower().endswith(".png"):
+            continue
+        try:
+            with open(os.path.join(bundled_dir, name), "rb") as f:
+                out[name] = hashlib.md5(f.read()).digest()
+        except OSError:
+            continue
+    return out
+
+
+def is_bundled_copy(parts_dir: str, fname: str, fingerprints: dict) -> bool:
+    """`parts/` 裡這個檔案是不是「還沒被換掉的內建樣板」。
+
+    **一定要比內容，不能只看檔名。** 這是 2026-08-21 找到的核心 bug：
+
+    內建檔叫 `suit_S_1.png` ~ `suit_S_8.png`，而 `next_part_path()` 會把使用者
+    自己抓的樣板寫進「目前空出來的最小編號」—— 內建檔被刪掉之後，那就是
+    `suit_S_1.png`。於是只看檔名的程式會把**使用者實機抓的清晰樣板當成內建糊圖**，
+    後果有三個，而且全都沒有任何錯誤訊息：
+
+    1. `load_part_templates()` 把它丟進 fallback，只要同標籤還有別的樣板就整組不用
+       —— 存了等於沒存。
+    2. `next_part_path()` 把它當成「該順手刪掉的內建檔」——
+       **下一次儲存會把上一次儲存的成果刪掉**，所以「多抓幾次」永遠不會累積。
+    3. 「清掉所有內建樣板」會把它一起刪掉，而按鈕上明明寫著「你自己抓的不會動」。
+
+    使用者的實際狀況（2026-08-21 實測）：67 個樣板裡有 19 個是自己抓的、卻坐在
+    內建的檔名上，每個花色真正拿來比對的只剩 1~2 張。難怪方塊會被認成愛心。
+    """
+    expected = fingerprints.get(fname)
+    if expected is None:
+        return False
+    try:
+        with open(os.path.join(parts_dir, fname), "rb") as f:
+            return hashlib.md5(f.read()).digest() == expected
+    except OSError:
+        return False
+
+
+# 自己抓的樣板要累積到幾張，才敢完全不用內建的那一組。
+#
+# 2026-08-21 拿使用者實機的樣板量出來的（留一法，查詢與樣板都是實機圖）：
+#
+#     政策                                    角落花色      點數
+#     只要有 1 張自己的就丟掉內建（舊行為）        78.1%       88.4%
+#     自己的滿 3 張才丟（同一個比較組一起判斷）     100.0%       95.3%
+#
+# 舊行為是為了解決「糊掉的內建 7 搶走清楚的 2」而寫的，但它在**樣板還很少**的時候
+# 反而是致命的：使用者的 suit_D 只有 1 張可用，一丟掉內建那 8 張，方塊就只能拿
+# 1 張去跟 3 張紅心比 —— 這就是「方塊被認成愛心」的直接原因。
+MIN_OWN_TO_DROP_BUNDLED = 3
+
+# 「會互相搶」的標籤要一起決定要不要丟內建。
+#
+# 花色是先用顏色縮成兩個候選才比形狀，所以 H 只跟 D 競爭、S 只跟 C 競爭。
+# 如果 H 有 3 張自己的、D 只有 1 張，各自決定的結果會是「3 張清楚的 H
+# vs 1 張清楚的 D + 8 張糊的 D」—— 一場不公平的比賽，而且偏向錯的那邊。
+# 同組一起判斷就不會出現這種情況。
+COMPARISON_GROUPS: dict = {
+    "suit": (("H", "D"), ("S", "C")),
+    "pip": (("H", "D"), ("S", "C")),
+    "rank": (tuple(RANKS),),
+}
+
+
+def _group_for(kind: str, key: str) -> tuple:
+    for group in COMPARISON_GROUPS.get(kind, ()):
+        if key in group:
+            return group
+    return (key,)
+
+
 def load_part_templates(parts_dir: str, bundled_dir: Optional[str] = None) -> dict:
     """載入 parts 資料夾裡的點數/花色樣板。
 
     檔名：rank_A.png、rank_10.png、suit_S.png ...（同一個可以有多張：rank_A_2.png）
 
-    `bundled_dir`（通常是 defaults/parts）用來分辨哪些檔案是內建的。
-    **只要某個點數／花色已經有你自己在實機截下來的樣板，那個標籤的內建樣板就整組不用。**
+    `bundled_dir`（通常是 defaults/parts）用來分辨哪些檔案是內建的
+    —— **比內容不比檔名**，原因見 `is_bundled_copy()`。
 
-    為什麼要這樣：內建那批是從 512 寬的縮圖放大來的，筆畫比實機糊一圈。
-    混在一起比對時，糊掉的「7」常常比清楚的「2」更像你螢幕上那個 2，
-    黑桃也會被糊掉的梅花搶走 —— 就是你看到的「2、5、8 一直問號」「黑桃梅花分不清」。
-    分開之後，有自己樣板的標籤完全乾淨，還沒蒐集到的才退回內建的頂著用。
+    內建那批是從 512 寬的縮圖放大來的，筆畫比實機糊一圈，混在一起比對時糊掉的
+    「7」有可能比清楚的「2」更像螢幕上那個 2。所以自己的樣板夠多之後就不用內建的；
+    但**夠多**是關鍵 —— 只有 1 張自己的就丟掉內建 8 張，結果比混著用還糟
+    （見 `MIN_OWN_TO_DROP_BUNDLED` 上面那張實測表）。
     """
     out: dict = {"rank": {}, "suit": {}, "pip": {}}
     if not os.path.isdir(parts_dir):
         return out
 
-    bundled_names: set = set()
-    if bundled_dir and os.path.isdir(bundled_dir):
-        bundled_names = {n for n in os.listdir(bundled_dir) if n.lower().endswith(".png")}
+    fingerprints = bundled_fingerprints(bundled_dir)
 
     own: dict = {"rank": {}, "suit": {}, "pip": {}}
     fallback: dict = {"rank": {}, "suit": {}, "pip": {}}
@@ -509,19 +663,111 @@ def load_part_templates(parts_dir: str, bundled_dir: Optional[str] = None) -> di
         size = PART_SIZES[kind]
         if (img.shape[1], img.shape[0]) != size:
             img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
-        img = centre_mask((img > 127).astype(np.uint8) * 255)
-        bucket = fallback if fname in bundled_names else own
+        cleaned = clean_part_mask((img > 127).astype(np.uint8) * 255, kind)
+        # **先判斷夠不夠格，再置中。** 順序反了會出事：centre_mask 是平移，
+        # 貼在畫布邊緣的圖案平移之後會被切掉一部分，外框變小、佔滿度掉下來，
+        # 於是一張好樣板被判成「裁壞的小點」而安靜丟掉。
+        # 實測使用者的樣板：先置中會誤殺 6 張（unusable_parts 只認出 6 張真的壞的，
+        # load_part_templates 卻丟了 12 張）—— 又是一個「存了卻沒生效」。
+        if not part_is_usable(cleaned):
+            # **不刪檔**，只是不拿來比對。使用者的檔案一律不動，這是這個專案的鐵則；
+            # 但也不能讓一個裁壞的小點把整組比對拖下水。
+            # 想知道跳過了哪些，用 unusable_parts()。
+            continue
+        img = centre_mask(cleaned)
+        bucket = fallback if is_bundled_copy(parts_dir, fname, fingerprints) else own
         bucket[kind].setdefault(key, []).append(img)
 
     for kind in out:
-        for key, imgs in own[kind].items():
-            out[kind][key] = list(imgs)
-        for key, imgs in fallback[kind].items():
-            out[kind].setdefault(key, list(imgs))
+        keys = set(own[kind]) | set(fallback[kind])
+        for key in keys:
+            group = _group_for(kind, key)
+            enough = all(len(own[kind].get(k, [])) >= MIN_OWN_TO_DROP_BUNDLED
+                         for k in group)
+            mine = own[kind].get(key, [])
+            theirs = fallback[kind].get(key, [])
+            pool = list(mine) if (enough and mine) else list(mine) + list(theirs)
+            if pool:
+                out[kind][key] = pool
     return out
 
 
-MAX_OWN_PER_LABEL = 8
+def part_inventory(parts_dir: str, bundled_dir: Optional[str] = None) -> dict:
+    """每個標籤的樣板統計，給 GUI 的「蒐集進度」用。
+
+    回傳 `{kind: {key: {"own": n, "bundled": n, "junk": n, "in_use": n,
+                        "dropping_bundled": bool}}}`
+
+    為什麼要有這個：載入時「裁壞的安靜跳過」「內建的不用」都是對的行為，
+    但使用者完全看不到。他實際的狀況是 suit_D 有 3 個檔案、其中 2 個是裁壞的小點，
+    真正拿來比對的只有 1 張 —— 畫面上卻只顯示「已有自己的樣板 ✓」。
+    難怪他覺得「多抓幾次好像都沒變化」。
+    """
+    fingerprints = bundled_fingerprints(bundled_dir)
+    stats: dict = {"rank": {}, "suit": {}, "pip": {}}
+    if not os.path.isdir(parts_dir):
+        return stats
+    for fname in sorted(os.listdir(parts_dir)):
+        parsed = parse_part_name(fname)
+        if parsed is None:
+            continue
+        kind, key = parsed
+        row = stats[kind].setdefault(
+            key, {"own": 0, "bundled": 0, "junk": 0, "in_use": 0,
+                  "dropping_bundled": False})
+        img = cv2.imread(os.path.join(parts_dir, fname), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            continue
+        size = PART_SIZES[kind]
+        if (img.shape[1], img.shape[0]) != size:
+            img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
+        cleaned = clean_part_mask((img > 127).astype(np.uint8) * 255, kind)
+        if not part_is_usable(cleaned):
+            row["junk"] += 1
+            continue
+        if is_bundled_copy(parts_dir, fname, fingerprints):
+            row["bundled"] += 1
+        else:
+            row["own"] += 1
+
+    loaded = load_part_templates(parts_dir, bundled_dir)
+    for kind, rows in stats.items():
+        for key, row in rows.items():
+            row["in_use"] = len(loaded[kind].get(key, []))
+            group = _group_for(kind, key)
+            row["dropping_bundled"] = all(
+                stats[kind].get(k, {}).get("own", 0) >= MIN_OWN_TO_DROP_BUNDLED
+                for k in group)
+    return stats
+
+
+def unusable_parts(parts_dir: str) -> list[tuple[str, float]]:
+    """列出 parts 資料夾裡「裁壞了、不會被拿來比對」的樣板檔。
+
+    回傳 [(檔名, 佔滿度), ...]，由小到大。給 bot 啟動時與 check_setup 報告用 ——
+    載入時只是安靜跳過，不講的話使用者永遠不知道自己存了幾個廢檔。
+    """
+    bad: list[tuple[str, float]] = []
+    if not os.path.isdir(parts_dir):
+        return bad
+    for fname in sorted(os.listdir(parts_dir)):
+        if parse_part_name(fname) is None:
+            continue
+        img = cv2.imread(os.path.join(parts_dir, fname), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            continue
+        coverage = part_coverage(img)
+        if coverage < MIN_PART_COVERAGE:
+            bad.append((fname, round(coverage, 3)))
+    return sorted(bad, key=lambda r: r[1])
+
+
+# 同一個點數／花色最多留幾張「自己抓的」樣板。
+#
+# 比對是取所有樣板裡的最高分，所以多存只會更容易命中（代價只是多幾次 24x32 的
+# 小圖比對，可以忽略）。原本是 8，但實測使用者的 rank_5 早就存滿 8 張、
+# 再抓也存不進去 —— 而他正是覺得「多抓幾次好像都沒變化」的人。
+MAX_OWN_PER_LABEL = 16
 
 
 def next_part_path(parts_dir: str, bundled_dir: str, kind: str, key: str,
@@ -530,28 +776,65 @@ def next_part_path(parts_dir: str, bundled_dir: str, kind: str, key: str,
 
     回傳 `(路徑, [要刪掉的內建檔絕對路徑])`；已經存夠自己的樣板時回傳 `(None, [])`。
 
-    這裡曾經有一個很難發現的 bug：內建樣板每個花色剛好 8 張
-    （suit_S_1~8、suit_C_1~8…），而「同一個標籤最多留 8 張」的上限把內建的也算進去，
-    於是一開始就「已經滿了」——按幾次「全部儲存」都不會存下任何花色，畫面也不報錯。
-    使用者只會看到花色永遠認不準，卻完全不知道原因。
+    ## 兩個踩過的坑
 
-    所以上限**只算使用者自己抓的**；而且只要開始存自己的樣板，
-    同標籤的內建檔就刪掉（反正比對時本來就會被忽略）。
+    **坑一（2026-08-20）**：內建樣板每個花色剛好 8 張（suit_S_1~8…），而
+    「同一個標籤最多留 8 張」的上限把內建的也算進去，於是一開始就「已經滿了」——
+    按幾次「全部儲存」都不會存下任何花色，畫面也不報錯。
+    所以上限**只算使用者自己抓的**。
+
+    **坑二（2026-08-21，就是坑一的修法本身帶出來的）**：
+    「哪些是內建的」原本只比檔名。內建檔被刪掉之後，編號 1~8 就空出來了，
+    於是下一次儲存又寫進 `suit_D_1.png` —— 一個**檔名看起來像內建、內容是使用者
+    自己抓的**檔案。它會同時被判成 stale（下次儲存刪掉它）與 fallback
+    （比對時不用它）。淨效果：**每次儲存都把上一次的成果刪掉，永遠累積不起來。**
+
+    修法有三層：
+    1. 「是不是內建」改成比**內容**（`is_bundled_copy`），修好已經存在的檔案；
+    2. 新檔的編號一律從「內建的最大編號 + 1」開始，讓檔名**不可能**再撞上內建的；
+    3. **儲存時不再刪掉內建檔**（回傳的 stale 永遠是空的，見下）。
+
+    ## 為什麼不再刪內建檔
+
+    「存自己的就順手刪內建的」是為了修坑一而加的，當時上限會把內建的算進去。
+    現在上限只算自己的，刪除已經沒有必要 —— 而且變成有害：
+    `load_part_templates()` 要等自己的累積到 `MIN_OWN_TO_DROP_BUNDLED` 張才會
+    不用內建的，在那之前**需要內建那批當墊背**。第一次儲存就把它們刪掉，
+    等於把墊背抽掉，方塊只剩 1 張樣板去跟紅心比。
+
+    想清掉內建的仍然可以，但要使用者明確按「清掉所有內建樣板」——
+    存檔這條路上不再有任何刪檔動作，這也讓「多抓幾次」不可能再倒退。
     """
     prefix = f"{kind}_{key}_"
-    bundled_names: set = set()
-    if os.path.isdir(bundled_dir):
-        bundled_names = {n for n in os.listdir(bundled_dir) if n.lower().endswith(".png")}
+    fingerprints = bundled_fingerprints(bundled_dir)
     existing = [f for f in os.listdir(parts_dir)
                 if f.lower().endswith(".png") and f.startswith(prefix)]
-    own = [f for f in existing if f not in bundled_names]
+    own = [f for f in existing if not is_bundled_copy(parts_dir, f, fingerprints)]
     if len(own) >= max_own:
         return None, []
-    stale = [os.path.join(parts_dir, f) for f in existing if f in bundled_names]
-    i = 1
+
+    # 從「內建的最大編號 + 1」起跳，新檔名不會再撞上內建的
+    i = _first_free_index(parts_dir, prefix, _highest_bundled_index(fingerprints, prefix) + 1)
+    # 第二個回傳值保留成「要順手刪掉的檔案」，但**永遠是空的**（見上面的說明）。
+    return os.path.join(parts_dir, f"{prefix}{i}.png"), []
+
+
+def _highest_bundled_index(fingerprints: dict, prefix: str) -> int:
+    highest = 0
+    for name in fingerprints:
+        if not name.startswith(prefix):
+            continue
+        stem = os.path.splitext(name)[0][len(prefix):]
+        if stem.isdigit():
+            highest = max(highest, int(stem))
+    return highest
+
+
+def _first_free_index(parts_dir: str, prefix: str, start: int) -> int:
+    i = max(1, start)
     while os.path.exists(os.path.join(parts_dir, f"{prefix}{i}.png")):
         i += 1
-    return os.path.join(parts_dir, f"{prefix}{i}.png"), stale
+    return i
 
 
 def part_sources(parts_dir: str, bundled_dir: str) -> dict:
@@ -559,9 +842,7 @@ def part_sources(parts_dir: str, bundled_dir: str) -> dict:
 
     回傳 {"rank": {"2": True, "3": False, ...}, ...}，True = 已有自己的樣板。
     """
-    bundled_names: set = set()
-    if os.path.isdir(bundled_dir):
-        bundled_names = {n for n in os.listdir(bundled_dir) if n.lower().endswith(".png")}
+    fingerprints = bundled_fingerprints(bundled_dir)
     out: dict = {"rank": {}, "suit": {}, "pip": {}}
     if not os.path.isdir(parts_dir):
         return out
@@ -570,8 +851,22 @@ def part_sources(parts_dir: str, bundled_dir: str) -> dict:
         if parsed is None:
             continue
         kind, key = parsed
-        out[kind][key] = out[kind].get(key, False) or (fname not in bundled_names)
+        mine = not is_bundled_copy(parts_dir, fname, fingerprints)
+        out[kind][key] = out[kind].get(key, False) or mine
     return out
+
+
+def bundled_copies_present(parts_dir: str, bundled_dir: str) -> list:
+    """`parts/` 裡「內容真的還是內建樣板」的檔名清單（排序過）。
+
+    給「清掉所有內建樣板」用。以前是比檔名，於是那顆按鈕會把使用者自己抓的
+    19 個樣板一起刪掉 —— 而按鈕上明明寫著「你自己抓的不會動」。
+    """
+    if not os.path.isdir(parts_dir):
+        return []
+    fingerprints = bundled_fingerprints(bundled_dir)
+    return sorted(f for f in os.listdir(parts_dir)
+                  if is_bundled_copy(parts_dir, f, fingerprints))
 
 
 # 加上質心對位之後，正解分數中位數 0.97、最低 0.89，錯誤答案的領先幅度中位數 +0.30，

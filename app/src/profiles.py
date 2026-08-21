@@ -141,6 +141,15 @@ def active_profile(cfg: dict) -> Optional[dict]:
     return find_by_label(cfg, label) if label else None
 
 
+def is_hand_calibrated(profile: dict) -> bool:
+    """使用者真的在這個比例下框選過嗎？
+
+    複製來的（`seeded_from`）與換算來的（`derived_from`）都隨時能再產生一次，
+    人工校準的丟掉就沒了。任何「要淘汰誰」「可以覆蓋誰」的判斷都該問這個函式。
+    """
+    return not profile.get("seeded_from") and not profile.get("derived_from")
+
+
 def _make_profile(label: str, width: int, height: int, regions: dict, points: dict,
                   seeded_from: Optional[str] = None) -> dict:
     """一律深拷貝座標 —— profile 與工作副本共用同一個 dict 會讓「隨手微調」
@@ -358,6 +367,19 @@ def select_for_window(cfg: dict, width: int, height: int,
 
     # 沒有這個比例的校準 —— 但不必借、也不必猜：直接從最接近的那組**算**出來。
     # 遊戲的 UI 排在一個置中的 16:9 內容框裡，所以換算是精確的（見 derive()）。
+    #
+    # 但是先擋一件事：**好唸的名字容許 4% 誤差（LABEL_TOLERANCE），共用校準只
+    # 容許 2%（tolerance）。** 中間那 2%~4% 的尺寸會拿到「跟現有那組同名、
+    # 但其實是另一種比例」的標籤，而下面的迴圈是「同名就丟掉」——
+    # 於是使用者手工校準的成果會被一組換算來的悄悄取代。
+    #
+    # 實例：手工校準的 21:9 是 1937x817（2.3708）。把視窗拉成 3420x1500（2.28）
+    # 時，label_for 仍然叫它「21:9」（差 2.3%，在命名容許範圍內），但跟 2.3708
+    # 差 3.83%（超過共用容許範圍）—— 舊版就在這裡把 1937x817 那組刪掉了。
+    # 主控台改成「視窗尺寸一變就自動偵測」之後，這條路變得非常容易踩到。
+    same_label = find_by_label(cfg, wanted_label)
+    if same_label is not None and is_hand_calibrated(same_label):
+        wanted_label = f"{wanted_label} ({width}x{height})"
     derived = derive(cfg, profile, width, height, wanted_label)
     profiles = get_profiles(cfg)
     for i, item in enumerate(list(profiles)):
@@ -433,26 +455,33 @@ def sync_active(cfg: dict) -> Optional[dict]:
 
 
 def _enforce_limit(profiles: list[dict], keep_label: Optional[str] = None) -> None:
-    """超過上限時，先丟「複製來的、沒真正校準過」的那些，再丟最舊的。
+    """超過上限時，**先丟不是人工校準的那些**，最後才丟最舊的。
 
     永遠不會丟 keep_label 那一組。
+
+    「先丟非人工校準的」很重要：把遊戲視窗慢慢拖大的過程會經過一堆怪比例
+    （2.08:1、1.95:1…），每一種都會生出一組換算來的 profile。舊版的淘汰順序是
+    「seeded_from 的 → 最舊的」，而使用者手工校準的那組通常就是**最舊的第一組**
+    —— 拖幾次視窗就足以把它擠掉。換算來的隨時能再算一次，人工校準的丟掉就沒了。
     """
     while len(profiles) > MAX_PROFILES:
-        victim = None
-        for profile in profiles:
-            if profile.get("label") == keep_label:
-                continue
-            if profile.get("seeded_from"):
-                victim = profile
-                break
-        if victim is None:
-            for profile in profiles:
-                if profile.get("label") != keep_label:
-                    victim = profile
-                    break
+        victim = _pick_victim(profiles, keep_label)
         if victim is None:
             return
         profiles.remove(victim)
+
+
+def _pick_victim(profiles: list[dict], keep_label: Optional[str]) -> Optional[dict]:
+    candidates = [p for p in profiles if p.get("label") != keep_label]
+    for is_expendable in (
+        lambda p: bool(p.get("seeded_from")),    # 複製來的，最沒價值
+        lambda p: bool(p.get("derived_from")),   # 換算來的，隨時能再算一次
+        lambda _p: True,                         # 都不是才動人工校準的（最舊的那組）
+    ):
+        for profile in candidates:
+            if is_expendable(profile):
+                return profile
+    return None
 
 
 def save_as(cfg: dict, width: int, height: int,
@@ -481,6 +510,12 @@ def save_as(cfg: dict, width: int, height: int,
         seeded_from = None
         if cfg.get("active_profile") is None and existing is not None:
             seeded_from = existing.get("label")
+        # 同名但比例其實不同（命名容許 4%、共用校準只容許 2%）的時候，
+        # 名字要帶上尺寸。否則清單裡會出現兩個「21:9」，
+        # 主控台的下拉選單挑到的永遠是第一個，另一個等於選不到。
+        clash = find_by_label(cfg, label)
+        if clash is not None:
+            label = f"{label} ({width}x{height})"
         target = _make_profile(label, width, height,
                                cfg.get("regions") or {}, cfg.get("points") or {},
                                seeded_from=seeded_from)

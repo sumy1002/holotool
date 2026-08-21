@@ -229,3 +229,43 @@ def clamp_window_to_screen(x, y, width: int, height: int,
     max_x = max(0, screen_w - width)
     max_y = max(0, screen_h - height)
     return max(0, min(int(x), max_x)), max(0, min(int(y), max_y))
+
+
+# 小面板離螢幕邊緣留多少。校準遮罩的範例圖用這個值。
+PANEL_MARGIN = 24
+
+
+def choose_panel_corner(panel_w: int, panel_h: int, screen_w: int, screen_h: int,
+                        obstacles: list, margin: int = PANEL_MARGIN) -> tuple[int, int]:
+    """挑一個蓋到最少東西的螢幕角落放小面板，回傳左上角座標。
+
+    給校準遮罩的「範例圖」用（`src/overlay.py`）。預設右上角；但校準項目本身就在
+    右上角時（例如「大」按鈕），範例圖會正好把使用者要瞄的地方遮住。說明文字那
+    一大塊也算障礙物 —— 疊在一起兩邊都讀不了。
+
+    `obstacles` 是一串 `(x0, y0, x1, y1)`。四個角落都被佔住時選重疊面積最小的，
+    不會丟例外 —— 提示擺得不夠漂亮無所謂，校準流程中斷才是大事。
+
+    跟 `clamp_window_to_screen` 一樣刻意放在 geometry：這裡沒有 tkinter 依賴，
+    在沒有 GUI 的環境（CI、純文字的機器）也測得到。
+    """
+    corners = [
+        (screen_w - panel_w - margin, margin),                          # 右上（預設）
+        (margin, margin),                                               # 左上
+        (screen_w - panel_w - margin, screen_h - panel_h - margin),     # 右下
+        (margin, screen_h - panel_h - margin),                          # 左下
+    ]
+    if not obstacles:
+        return corners[0]
+    best, best_overlap = corners[0], None
+    for x, y in corners:
+        overlap = 0
+        for ox0, oy0, ox1, oy1 in obstacles:
+            dx = max(0, min(x + panel_w, ox1) - max(x, ox0))
+            dy = max(0, min(y + panel_h, oy1) - max(y, oy0))
+            overlap += dx * dy
+        if best_overlap is None or overlap < best_overlap:
+            best, best_overlap = (x, y), overlap
+        if overlap == 0:
+            break
+    return best

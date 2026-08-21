@@ -195,6 +195,107 @@ def _supports_contents_directory(python: str) -> bool:
     return major >= 6
 
 
+def _locked_files(folder: str, limit: int = 6) -> list[str]:
+    """列出 folder 底下「現在打不開來寫」的執行檔／DLL。
+
+    Windows 上這幾乎一定代表**那個程式正在執行**：執行中的 exe / dll 映像檔
+    是以 FILE_SHARE_READ 開著的，所以任何人都讀得到、但誰都不能寫或刪。
+
+    為什麼要先檢查：PyInstaller 的 `--noconfirm` 會在 COLLECT 階段把整個
+    `dist\\HoloTool\\` 砍掉重建。HoloTool 還開著的時候那一步一定失敗，而
+    PyInstaller 只回一個結束碼 1 —— 前面 Analysis / PYZ / EXE 都成功了，
+    看起來像「打包壞掉」，實際上只是要先關掉程式。這種錯誤訊息不值得再查一次。
+
+    用 `open(path, "r+b")` 探測：要求寫入權限但不寫任何東西，所以不會改到檔案。
+    """
+    if not os.path.isdir(folder):
+        return []
+    locked: list[str] = []
+    for dirpath, _dirnames, filenames in os.walk(folder):
+        for name in filenames:
+            if not name.lower().endswith((".exe", ".dll", ".pyd")):
+                continue
+            path = os.path.join(dirpath, name)
+            try:
+                with open(path, "r+b"):
+                    pass
+            except OSError:
+                locked.append(path)
+                if len(locked) >= limit:
+                    return locked
+    return locked
+
+
+def _short(path: str) -> str:
+    """盡量印相對路徑，跨磁碟時退回絕對路徑。
+
+    `os.path.relpath` 在 Windows 上遇到**不同磁碟**會丟
+    `ValueError: path is on mount 'C:', start on mount 'F:'`。
+    這個函式只用在「打包失敗、要把原因印出來」的路徑上 ——
+    在那裡丟例外等於把真正的錯誤原因換成一個不相干的 traceback，
+    是所有壞法裡最糟的一種。
+    """
+    try:
+        return os.path.relpath(path, ROOT)
+    except ValueError:
+        return path
+
+
+def _abort_if_output_locked() -> None:
+    locked = _locked_files(DIST_DIR)
+    if not locked:
+        return
+    listing = "\n".join(f"    {_short(p)}" for p in locked)
+    raise SystemExit(
+        "\n打包中止：dist\\HoloTool\\ 裡有檔案正在使用中，PyInstaller 沒辦法把它清掉。\n\n"
+        f"{listing}\n\n"
+        "**請先把 HoloTool 完全關掉再重跑一次**：\n"
+        "  · 主視窗關掉\n"
+        "  · 「縮成迷你視窗」的那個小方塊也要關（它沒有標題列，很容易忘記）\n"
+        "  · 工作管理員裡如果還看得到 HoloTool.exe，直接結束它\n\n"
+        "（這次什麼都沒有被改動，dist\\HoloTool 還是舊版，可以照常使用。）"
+    )
+
+
+def _run_pyinstaller(cmd: list[str]) -> tuple[int, str]:
+    """跑 PyInstaller，一邊即時印出、一邊完整寫進 log 檔。
+
+    回傳 (結束碼, log 路徑)。
+
+    為什麼要留 log：PyInstaller 動輒印幾百行，真正的錯誤在中間某一行，
+    而終端機的回捲緩衝區常常已經蓋掉了 —— 尤其是從 release.bat 一路跑下來的時候。
+    有一個檔案在，就永遠問得出「到底是哪一行爆的」。
+    """
+    os.makedirs(WORK_PATH, exist_ok=True)
+    log_path = os.path.join(WORK_PATH, "pyinstaller-last.log")
+    with open(log_path, "w", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            cmd, cwd=ROOT,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+        )
+        with process:
+            assert process.stdout is not None
+            for line in process.stdout:
+                line = line.rstrip("\n")
+                log.write(line + "\n")
+                try:
+                    print(line)
+                except UnicodeEncodeError:
+                    # 某些主控台編碼吃不下 PyInstaller 印出來的路徑，不該中斷打包
+                    print(line.encode("ascii", "replace").decode("ascii"))
+            code = process.wait()
+    return code, log_path
+
+
+def _tail(path: str, lines: int = 30) -> str:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return "".join(f.readlines()[-lines:])
+    except OSError:
+        return ""
+
+
 def _find_python() -> str:
     """找虛擬環境的 python.exe；找不到就用目前這一個。"""
     for base in (ROOT, PROJECT):
@@ -250,6 +351,9 @@ def main() -> None:
     os.chdir(ROOT)
 
     version = _print_version_banner()
+    # 先確認 dist\HoloTool 可以被清掉，再花好幾分鐘做 Analysis。
+    # 反過來的順序（PyInstaller 跑完才發現刪不掉）就是「等三分鐘換一個結束碼 1」。
+    _abort_if_output_locked()
     backup = _backup_dist()
     if backup:
         print(f"已備份目前的 dist\\HoloTool → {backup}")
@@ -310,6 +414,9 @@ def main() -> None:
         "--hidden-import", "src.config",
         "--hidden-import", "src.cardparts",
         "--hidden-import", "src.defaults_layout",
+        "--hidden-import", "src.settings_layout",
+        "--hidden-import", "src.calibguide",
+        "--hidden-import", "src.reconcile",
         "--hidden-import", "src.version",
         "--hidden-import", "src.updater",
     ]
@@ -328,12 +435,25 @@ def main() -> None:
 
     cmd.append(os.path.join(PROJECT, "gui.py"))
     print("開始打包，第一次可能需要幾分鐘...")
-    result = subprocess.run(cmd, cwd=ROOT)
-    if result.returncode != 0:
+    returncode, log_path = _run_pyinstaller(cmd)
+    if returncode != 0:
+        # 失敗當下再檢查一次鎖定狀況：打包途中才把 HoloTool 打開的話，
+        # 開頭那次檢查是過的，但 COLLECT 階段還是會被卡住。
+        locked = _locked_files(DIST_DIR)
+        hint = ""
+        if locked:
+            hint = ("  · **dist\\HoloTool 裡有檔案正在使用中** ← 最可能就是這個。\n"
+                    "    請把 HoloTool 完全關掉（含「縮成迷你視窗」那個小方塊）再重跑。\n"
+                    f"    例如：{_short(locked[0])}\n")
         raise SystemExit(
-            f"\nPyInstaller 失敗（結束碼 {result.returncode}）。\n"
-            "真正的錯誤訊息在上面 PyInstaller 自己印的那幾行，往回捲一下就看得到。\n\n"
+            f"\nPyInstaller 失敗（結束碼 {returncode}）。\n\n"
+            f"完整輸出留在：{log_path}\n"
+            "最後 30 行：\n"
+            "------------------------------------------------------------\n"
+            f"{_tail(log_path)}"
+            "------------------------------------------------------------\n\n"
             "常見原因：\n"
+            f"{hint}"
             "  · 虛擬環境搬過位置 → 先跑一次 app\\packaging\\repair_venv.py\n"
             "  · 少裝套件 → \"{}\" -m pip install -r \"{}\"".format(
                 python, os.path.join(PROJECT, "requirements.txt"))
@@ -363,7 +483,11 @@ def main() -> None:
                         "table_marker.png", "ui_draw_prompt.png", "ui_congrats.png",
                         "ui_challenge.png", "ui_fail.png", "ui_poker_fail.png",
                     }
-                    if os.path.isfile(s) and (not os.path.exists(d) or name in ui_markers):
+                    # defaults\ref\ 是校準用的範例圖，屬於程式資產而不是使用者資料，
+                    # 每次打包都要用新的覆蓋 —— 不然改過的範例圖永遠進不到 exe 版。
+                    is_reference = os.path.basename(dirpath) == "ref"
+                    if os.path.isfile(s) and (not os.path.exists(d)
+                                              or name in ui_markers or is_reference):
                         shutil.copy2(s, d)
 
     # 捷徑只放桌面。以前也會在專案根目錄放一份 HoloTool.lnk，但那會弄髒最外層。

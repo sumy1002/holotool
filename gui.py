@@ -18,6 +18,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import messagebox, ttk
+from typing import Optional
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -64,19 +65,36 @@ from src.config import (
 )
 from src.defaults_layout import UI_MARKER_FILES
 from src.controller import HotkeyManager
+from src import calibguide
 from src import profiles as profiles_mod
+from src import reconcile as reconcile_mod
+from src.settings_layout import (
+    INT_SETTINGS,
+    OTHER_FIELDS,
+    SETTING_FIELDS,
+    SETTING_SECTIONS,
+)
 from src.minipanel import MiniPanel
-from src.geometry import aspect_ratio_delta, pixels_point_to_ratio, pixels_region_to_ratio, scale_factor
-from src.handeval import Card
+from src.geometry import (
+    aspect_ratio_delta,
+    pixels_point_to_ratio,
+    pixels_region_to_ratio,
+    ratio_point_to_pixels,
+    ratio_region_to_pixels,
+    scale_factor,
+)
+from src.handeval import Card, normalize_label_input
 from src.overlay import CalibrationPreview, select_point, select_region
 from src.cardparts import (
-    RANKS,
-    SUITS,
+    MIN_OWN_TO_DROP_BUNDLED,
+    bundled_copies_present,
     extract_parts,
     missing_parts,
     next_part_path,
     parse_part_name,
+    part_inventory,
     rightmost_card_rect,
+    unusable_parts,
 )
 from src.paths import (
     default_parts_dir,
@@ -162,30 +180,53 @@ CALIB_TARGETS: list[tuple[str, str, str, str, str]] = [
      "請切到達到上限的結算畫面（顯示獲得硬幣／獲勝牌型／翻倍次數，右下有「再玩一次」）"),
 ]
 
-SETTING_FIELDS = [
-    ("match_threshold", "卡牌比對相似度門檻", "0~1，越高越嚴格。辨識不到牌可略微調低"),
-    ("min_match_margin", "辨識領先差距門檻", "最高分需領先第二名多少才採信，避免認錯相近的牌"),
-    ("marker_thresholds.table_marker", "牌桌標記門檻", "低於此值視為已離開牌桌（對話框會模糊 logo，屬正常）"),
-    ("marker_thresholds.draw_prompt", "選牌畫面門檻", "「選擇要保留的牌吧！」的比對門檻"),
-    ("marker_thresholds.congrats_marker", "過關畫面門檻", "「Congratulations！」的比對門檻"),
-    ("marker_thresholds.challenge_marker", "翻倍對話門檻", "「要挑戰嗎？」的比對門檻"),
-    ("marker_thresholds.fail_marker", "比大小失敗門檻", "「失敗」大字的比對門檻"),
-    ("marker_thresholds.poker_fail_marker", "湊牌失敗門檻", "「要再玩一次撲克嗎？」的比對門檻"),
-    ("marker_thresholds.max_win_marker", "達到上限門檻", "「已達最高獲得金額，遊戲結束」的比對門檻"),
-    ("daily_max_wins", "每日上限次數", "達到最高金額幾次之後就收工（遊戲規則是 2 次）"),
-    ("exit_table_ticks", "離桌判定 tick 數", "連續幾次看不到牌桌 logo 才停止（0.4 秒 × 25 ≈ 10 秒）"),
-    ("capture_interval_sec", "畫面偵測間隔（秒）", "越小反應越快，但越吃 CPU"),
-    ("action_cooldown_sec", "動作冷卻（秒）", "點完後至少等這麼久；遊戲跑得慢就調大，避免亂點"),
-    ("action_retry_sec", "漏收重試（秒）", "同一個畫面卡這麼久沒變，就再點一次"),
-    ("idle_confirm_sec", "待機確認（秒）", "畫面連續認不出來這麼久，才會去點「投注並開始」"),
-    ("multi_click_gap_sec", "連點間隔（秒）", "選牌時每點一張牌之間停多久"),
-    ("click_hold_min_sec", "滑鼠按住最短（秒）", "按下到放開的停留時間；遊戲漏收點擊就調大"),
-    ("click_hold_max_sec", "滑鼠按住最長（秒）", "同上，實際會在最短~最長之間隨機"),
-    ("monte_carlo_samples", "選牌模擬次數", "越大越準但越慢，建議 1000~5000"),
-    ("highlow_min_win_prob_to_continue", "比大小續押勝率門檻", "預估勝率低於此值就收手兌現"),
-    ("highlow_max_chain", "比大小最多連續加倍次數", "保險上限，避免無限追加"),
-    ("aspect_ratio_tolerance", "長寬比容許誤差", "超過就警告，0.02 = 2%"),
-]
+# 設定分頁的欄位分組（比對門檻／動作時間／其餘）放在 src/settings_layout.py，
+# 那邊沒有 tkinter 依賴，測試才驗得到「每個欄位都被歸到某一組、路徑真的存在」。
+
+
+class CollapsibleSection(ttk.Frame):
+    """可以收合的一區設定。
+
+    標題那一列是一顆按鈕（`▼ 標題` / `▶ 標題`），按下去把內容 pack_forget()。
+    ttk 沒有現成的可收合容器，自己包一層最單純，也不會影響外層的捲動區
+    —— 內容縮回去之後 `<Configure>` 會重算 scrollregion，捲軸自己會變短。
+
+    要往裡面塞東西時用 `section.body`，不要直接用 section。
+    """
+
+    def __init__(self, parent, title: str, subtitle: str = "", expanded: bool = True):
+        super().__init__(parent)
+        self._expanded = bool(expanded)
+        self._title = title
+
+        header = ttk.Frame(self)
+        header.pack(fill=tk.X)
+        self._button = ttk.Button(header, width=30, command=self.toggle)
+        self._button.pack(side=tk.LEFT)
+        if subtitle:
+            ttk.Label(header, text=subtitle, foreground="#777",
+                      wraplength=420, justify="left").pack(side=tk.LEFT, padx=(8, 0))
+
+        self.body = ttk.Frame(self)
+        if self._expanded:
+            self.body.pack(fill=tk.X, padx=(16, 0), pady=(4, 0))
+        self._sync()
+
+    def _sync(self) -> None:
+        arrow = "▼" if self._expanded else "▶"
+        self._button.config(text=f"{arrow}　{self._title}")
+
+    def toggle(self) -> None:
+        self._expanded = not self._expanded
+        if self._expanded:
+            self.body.pack(fill=tk.X, padx=(16, 0), pady=(4, 0))
+        else:
+            self.body.pack_forget()
+        self._sync()
+
+    @property
+    def expanded(self) -> bool:
+        return self._expanded
 
 
 class HoloToolGUI(tk.Tk):
@@ -221,10 +262,18 @@ class HoloToolGUI(tk.Tk):
         self._hover_calib_iid: str | None = None
         self._calib_preview_all = False
 
+        # 上一次自動偵測到的用戶端尺寸。用來判斷「視窗被拉成別的比例了」，
+        # 沒變就什麼都不做（否則 _pump 會每兩秒寫一次 config.json）。
+        self._detected_size: tuple[int, int] | None = None
+        # 拖曳中量到的中間尺寸。要連續兩次量到同一個值才視為「拖完了」。
+        self._settling_size: tuple[int, int] | None = None
+        self._detect_tick = 0
+
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._refresh_windows()
+        self._autodetect_profile(announce=False)
         self._refresh_calib_status()
         self._refresh_template_panel()
         self.after(200, self._pump)
@@ -248,15 +297,24 @@ class HoloToolGUI(tk.Tk):
         inner = ttk.Frame(canvas)
         window = canvas.create_window((0, 0), window=inner, anchor="nw")
 
-        def _on_inner(_event=None):
+        def _fit(_event=None):
+            # 寬度一律跟著 canvas，只捲上下，不要出現橫向捲軸。
+            #
+            # 高度取「內容要求的高度」與「canvas 目前高度」的**較大值**：
+            #   * 內容比視窗高 → 用內容高度，於是 scrollregion 超出可視範圍、捲軸有用
+            #   * 內容比視窗短 → 撐滿 canvas，裡面 expand=True 的元件（主控台的
+            #     執行紀錄、校準分頁的清單）才會跟著視窗長大
+            # 少了後面那一半，包進捲動區的分頁在大視窗下會變成上面擠一堆、
+            # 下面一大片空白 —— 等於為了小視窗能捲，犧牲了大視窗的可用性。
+            width = canvas.winfo_width()
+            height = max(inner.winfo_reqheight(), canvas.winfo_height())
+            current = (canvas.itemcget(window, "width"), canvas.itemcget(window, "height"))
+            if current != (str(width), str(height)):
+                canvas.itemconfigure(window, width=width, height=height)
             canvas.configure(scrollregion=canvas.bbox("all"))
 
-        def _on_canvas(event):
-            # 內容跟著寬度伸縮，只捲上下，不要出現橫向捲軸
-            canvas.itemconfigure(window, width=event.width)
-
-        inner.bind("<Configure>", _on_inner)
-        canvas.bind("<Configure>", _on_canvas)
+        inner.bind("<Configure>", _fit)
+        canvas.bind("<Configure>", _fit)
 
         def _on_wheel(event):
             # 內容比視窗還短時不要捲，否則會出現「捲到一半彈回來」的怪動作
@@ -265,10 +323,54 @@ class HoloToolGUI(tk.Tk):
                 return
             canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
 
-        # 只在滑鼠進到這塊區域時接管滾輪，才不會影響其他分頁
-        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_wheel))
-        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+        def _grab_wheel(_event=None):
+            canvas.bind_all("<MouseWheel>", _on_wheel)
+
+        def _release_wheel(_event=None):
+            # Tk 會在「滑鼠從 canvas 移到它的子元件上」時也送一個 <Leave>。
+            # 舊版直接 unbind，結果滑鼠一停在任何一個輸入框或標籤上，
+            # 滾輪就完全失效 —— 只有指到空白邊緣才捲得動。
+            # 所以先確認指標真的離開這塊區域了才交還滾輪。
+            x, y = canvas.winfo_pointerxy()
+            left, top = canvas.winfo_rootx(), canvas.winfo_rooty()
+            inside = (left <= x < left + canvas.winfo_width()
+                      and top <= y < top + canvas.winfo_height())
+            if not inside:
+                canvas.unbind_all("<MouseWheel>")
+
+        # 只在滑鼠進到這塊區域時接管滾輪，才不會影響其他分頁。
+        # inner 也要綁：從外面直接進到子元件上時不會經過 canvas 的 <Enter>。
+        canvas.bind("<Enter>", _grab_wheel)
+        canvas.bind("<Leave>", _release_wheel)
+        inner.bind("<Enter>", _grab_wheel, add="+")
         return inner
+
+    @staticmethod
+    def _keep_wheel_local(widget: tk.Widget) -> None:
+        """讓這個元件自己處理滾輪，不要被外層的捲動區搶走。
+
+        給有自己捲軸的元件用（例如樣板檔清單）。回傳 "break" 中斷事件傳遞，
+        所以 `bind_all` 那一層不會再收到。
+        """
+        def _on_wheel(event):
+            widget.yview_scroll(-1 if event.delta > 0 else 1, "units")
+            return "break"
+
+        widget.bind("<MouseWheel>", _on_wheel, add="+")
+
+    @staticmethod
+    def _wrap_to_width(label: ttk.Label, container: tk.Widget, margin: int = 40) -> None:
+        """讓說明文字的換行寬度跟著容器走，不要寫死一個數字。
+
+        寫死 wraplength 兩邊都難看：視窗縮小時文字被切掉，
+        視窗放大時右邊留一大片空白。
+        """
+        def _on_configure(event):
+            width = max(240, event.width - margin)
+            if int(label.cget("wraplength") or 0) != width:
+                label.config(wraplength=width)
+
+        container.bind("<Configure>", _on_configure, add="+")
 
     def _build_ui(self) -> None:
         self.notebook = ttk.Notebook(self)
@@ -292,7 +394,11 @@ class HoloToolGUI(tk.Tk):
     # ---------- 主控台 ----------
 
     def _build_main_tab(self) -> None:
-        frame = self.tab_main
+        # 主控台有六塊（遊戲視窗、視窗比例、自動遊玩、今日統計、版本與更新、執行紀錄），
+        # 視窗一縮小最下面的執行紀錄與「檢查更新」就被切掉、而且捲不過去。
+        # 整頁包進捲動區；內容比視窗短時 _scrollable 會撐滿高度，
+        # 所以大視窗下執行紀錄照樣會跟著長大。
+        frame = self._scrollable(self.tab_main)
 
         win_box = ttk.LabelFrame(frame, text="遊戲視窗")
         win_box.pack(fill=tk.X, padx=8, pady=6)
@@ -303,8 +409,30 @@ class HoloToolGUI(tk.Tk):
         ttk.Button(win_box, text="使用此視窗", command=self._use_selected_window).grid(row=0, column=2, padx=4)
         win_box.columnconfigure(0, weight=1)
 
-        self.window_status = ttk.Label(win_box, text="", foreground="#555")
+        self.window_status = ttk.Label(win_box, text="", foreground="#555",
+                                       wraplength=760, justify="left")
         self.window_status.grid(row=1, column=0, columnspan=3, padx=6, pady=(0, 6), sticky="w")
+
+        # 長寬比原本放在「校準」分頁，但那是本末倒置：使用者選好視窗的那一刻
+        # 就已經決定了是哪個比例，不該再要求他自己去另一個分頁挑一次。
+        # 現在選視窗（或視窗被拉成別的比例）就自動偵測並套用對應的那組校準，
+        # 想手動指定的人再從下拉選單改。校準分頁只顯示「目前正在校準哪一組」。
+        ratio_row = ttk.Frame(win_box)
+        ratio_row.grid(row=2, column=0, columnspan=3, padx=6, pady=(0, 4), sticky="we")
+        ttk.Label(ratio_row, text="視窗比例").pack(side=tk.LEFT)
+        self.profile_combo = ttk.Combobox(ratio_row, state="readonly", width=22, values=[])
+        self.profile_combo.pack(side=tk.LEFT, padx=(6, 4))
+        self.profile_combo.bind("<<ComboboxSelected>>", self._on_profile_choice)
+        ttk.Button(ratio_row, text="重新偵測",
+                   command=lambda: self._autodetect_profile(force=True)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(ratio_row, text="另存為目前比例的校準",
+                   command=self._save_profile_for_current).pack(side=tk.LEFT, padx=4)
+        ttk.Button(ratio_row, text="刪除這一組",
+                   command=self._delete_selected_profile).pack(side=tk.LEFT, padx=4)
+
+        self.profile_status = ttk.Label(win_box, text="", foreground="#06c", justify="left",
+                                       wraplength=760)
+        self.profile_status.grid(row=3, column=0, columnspan=3, padx=6, pady=(0, 8), sticky="w")
 
         ctrl_box = ttk.LabelFrame(frame, text="自動遊玩")
         ctrl_box.pack(fill=tk.X, padx=8, pady=6)
@@ -342,7 +470,20 @@ class HoloToolGUI(tk.Tk):
         stats_box = ttk.LabelFrame(frame, text="今日統計")
         stats_box.pack(fill=tk.X, padx=8, pady=6)
         self.stats_label = ttk.Label(stats_box, text="—", font=("Consolas", 10))
-        self.stats_label.pack(padx=10, pady=8, anchor="w")
+        self.stats_label.pack(padx=10, pady=(8, 2), anchor="w")
+
+        recon_row = ttk.Frame(stats_box)
+        recon_row.pack(fill=tk.X, padx=10, pady=(0, 4))
+        self.reconcile_btn = ttk.Button(recon_row, text="補算未記錄的數值",
+                                       command=self._reconcile_stats)
+        self.reconcile_btn.pack(side=tk.LEFT)
+        ttk.Label(recon_row,
+                  text="從執行紀錄與其他安裝的統計檔找出還沒算進機率模型的牌（可以重複按，不會重複計算）",
+                  foreground="#777", wraplength=560, justify="left").pack(side=tk.LEFT, padx=8)
+
+        self.reconcile_status = ttk.Label(stats_box, text="", foreground="#06c",
+                                         wraplength=760, justify="left")
+        self.reconcile_status.pack(padx=10, pady=(0, 8), anchor="w")
 
         upd_box = ttk.LabelFrame(frame, text="版本與更新")
         upd_box.pack(fill=tk.X, padx=8, pady=6)
@@ -365,16 +506,24 @@ class HoloToolGUI(tk.Tk):
         self.log_text.configure(yscrollcommand=scroll.set)
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0), pady=6)
         scroll.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 6), pady=6)
+        # 主控台現在整頁包在捲動區裡，而捲動區是用 bind_all 接管滾輪的。
+        # 不特別處理的話，滑鼠停在執行紀錄上轉滾輪會捲整頁而不是捲紀錄 ——
+        # 這塊有自己的捲軸，滾輪本來就該歸它。
+        self._keep_wheel_local(self.log_text)
 
     # ---------- 校準 ----------
 
     def _build_calib_tab(self) -> None:
-        frame = self.tab_calib
+        # 同樣包進捲動區：上面那段說明加上五排按鈕就佔掉不少高度，
+        # 視窗縮小時校準清單與預覽會被壓到看不見。
+        frame = self._scrollable(self.tab_calib)
 
         ttk.Label(
             frame,
             text="依序校準會照遊戲流程分組，每換一組會先跳出提示，請把遊戲切到該畫面再開始框選。\n"
                  "實際流程：投注並開始 → 點要保留的牌 → 替換 → Congratulations 點擊繼續 → 進行挑戰/取消 → 大/小 → 失敗再一次。\n"
+                 "框選時：畫面角落有一張半透明「範例圖」告訴你這一項該框到哪（按 H 可隱藏），"
+                 "遊戲畫面上的虛線框／十字則是建議位置，照著描或自己調整都可以。\n"
                  "半透明瞄點不是當機；HoloTool 會留在工作列。Esc 跳過這一項，Q / 右鍵結束校準。\n"
                  "也可以先按「套用截圖預設框選」，之後再只微調對不準的項目。\n"
                  "滑鼠移到清單項目上，右邊會顯示遊戲截圖與框選位置（不會蓋住遊戲）。",
@@ -391,27 +540,12 @@ class HoloToolGUI(tk.Tk):
         self.preview_all_btn.pack(side=tk.LEFT, padx=6)
         ttk.Button(btn_row, text="重新整理狀態", command=self._refresh_calib_status).pack(side=tk.LEFT, padx=6)
 
-        prof_box = ttk.LabelFrame(frame, text="視窗長寬比（16:9 / 21:9 / 4:3 各存一組校準）")
-        prof_box.pack(fill=tk.X, padx=10, pady=(10, 0))
-        ttk.Label(
-            prof_box,
-            text="遊戲換長寬比時排版會跟著動，所以每種比例各存一組座標，程式依視窗當下的比例自動挑。\n"
-                 "沒有對應那一組時會先借最接近的頂著（位置會歪），這時按下面那顆先建立一組，再重新框選。\n"
-                 "校準完存檔只會寫進「生效中」那一組，不會動到其他比例的校準。",
-            foreground="#555", justify="left",
-        ).pack(anchor="w", padx=8, pady=(6, 2))
-
-        prof_row = ttk.Frame(prof_box)
-        prof_row.pack(fill=tk.X, padx=8, pady=(0, 6))
-        ttk.Button(prof_row, text="另存為目前比例的校準",
-                   command=self._save_profile_for_current).pack(side=tk.LEFT, padx=(0, 6))
-        self.profile_combo = ttk.Combobox(prof_row, state="readonly", width=14, values=[])
-        self.profile_combo.pack(side=tk.LEFT, padx=(6, 4))
-        ttk.Button(prof_row, text="刪除這一組",
-                   command=self._delete_selected_profile).pack(side=tk.LEFT, padx=4)
-
-        self.profile_status = ttk.Label(prof_box, text="", foreground="#06c", justify="left")
-        self.profile_status.pack(anchor="w", padx=8, pady=(0, 8))
+        # 比例的挑選與管理都在「主控台」——這裡只講「你現在校準的是哪一組」，
+        # 因為那是校準時唯一需要知道的事（校準結果只會寫進這一組）。
+        self.calib_profile_banner = ttk.Label(
+            frame, text="", foreground="#06c", justify="left", wraplength=900,
+            font=("Microsoft JhengHei", 10, "bold"))
+        self.calib_profile_banner.pack(anchor="w", padx=10, pady=(10, 0))
 
         self.calib_progress = ttk.Label(frame, text="滑鼠移到項目上即可預覽框選位置",
                                         font=("Microsoft JhengHei", 11, "bold"), foreground="#06c")
@@ -436,6 +570,8 @@ class HoloToolGUI(tk.Tk):
 
         self.calib_tree.tag_configure("done", foreground="#0a6")
         self.calib_tree.tag_configure("todo", foreground="#c33")
+        # 校準清單有十幾項、自己會捲，滾輪歸它（同上，捲動區用 bind_all 接管滾輪）
+        self._keep_wheel_local(self.calib_tree)
 
         preview_box = ttk.LabelFrame(body, text="框選預覽（遊戲截圖）")
         preview_box.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
@@ -457,76 +593,161 @@ class HoloToolGUI(tk.Tk):
 
     # ---------- 點數 / 花色樣板 ----------
 
-    def _build_template_tab(self) -> None:
-        frame = self.tab_tmpl
+    # 一格「抓到的牌」大約要多寬（含 padding）。用來算視窗縮小時要排成幾欄。
+    _PART_CELL_WIDTH = 92
 
-        ttk.Label(
+    def _build_template_tab(self) -> None:
+        # 舊版是「左邊六格、右邊蒐集進度」左右並排的固定 grid，視窗一縮小
+        # 六格就被切掉、而且沒有捲軸可以捲過去 —— 等於整個功能消失。
+        # 現在整頁包進捲動區，六格會依寬度自動換行，蒐集進度改放最下面並可收合。
+        frame = self._scrollable(self.tab_tmpl)
+
+        self.tmpl_help = ttk.Label(
             frame,
             text="辨識牌面只需要「13 個點數 + 4 個花色」，不用蒐集 52 張整卡。"
                  "在選牌畫面按「讀取目前畫面」，程式會自動把五張手牌的左上角切出來並猜出牌面；"
                  "確認無誤就按「全部儲存」，猜錯的自己改掉再存。玩一兩局就能湊齊。"
                  "代號格式：點數 + 花色，例如 10H、AS、QD。"
-                 "花色 S=黑桃 H=紅心 D=方塊 C=梅花；不要的那格清空即可。",
+                 "花色 S=黑桃 H=紅心 D=方塊 C=梅花；不要的那格清空即可。"
+                 "代號欄只吃英數字（大小寫都一樣），並且關掉了輸入法，不必再切中英文。",
             foreground="#555",
             justify="left",
             wraplength=620,
-        ).pack(anchor="w", padx=10, pady=8)
+        )
+        self.tmpl_help.pack(anchor="w", padx=10, pady=8, fill=tk.X)
+        self._wrap_to_width(self.tmpl_help, frame)
 
         bar = ttk.Frame(frame)
         bar.pack(fill=tk.X, padx=10)
         ttk.Button(bar, text="讀取目前畫面", command=self._capture_parts).pack(side=tk.LEFT)
         ttk.Button(bar, text="全部儲存", command=self._save_parts).pack(side=tk.LEFT, padx=6)
-        self.parts_hint = ttk.Label(bar, text="", foreground="#777")
+        self.parts_hint = ttk.Label(bar, text="", foreground="#777", wraplength=320,
+                                    justify="left")
         self.parts_hint.pack(side=tk.LEFT, padx=10)
 
-        body = ttk.Frame(frame)
-        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
-
-        left = ttk.LabelFrame(body, text="這一輪抓到的牌")
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        cards_box = ttk.LabelFrame(frame, text="這一輪抓到的牌")
+        cards_box.pack(fill=tk.X, expand=False, padx=10, pady=6)
+        self._parts_grid = ttk.Frame(cards_box)
+        self._parts_grid.pack(fill=tk.X, padx=4, pady=4)
 
         self._part_slots = []
+        self._part_cells = []
         for i in range(6):
-            cell = ttk.Frame(left)
-            cell.grid(row=0, column=i, padx=2, pady=4, sticky="n")
-            name = f"手牌{i + 1}" if i < 5 else "比大小"
-            ttk.Label(cell, text=name, foreground="#666").pack()
+            cell = ttk.Frame(self._parts_grid)
+            # 手牌 1~5 只存在於選牌畫面，比大小那張只存在於比大小畫面 ——
+            # 兩個畫面不可能同時出現。所以名稱要講清楚是哪個畫面的，
+            # 而且 _capture_parts() 只會填「目前這個畫面」那一組（見那邊的說明）。
+            name = f"手牌{i + 1}" if i < 5 else "★ 比大小"
+            colour = "#666" if i < 5 else "#a05000"
+            ttk.Label(cell, text=name, foreground=colour).pack()
             preview = ttk.Label(cell, text="—", anchor="center", relief="groove", width=6)
             preview.pack(pady=2, ipady=12)
             var = tk.StringVar()
             entry = ttk.Entry(cell, width=5, textvariable=var,
                               font=("Consolas", 11), justify="center")
             entry.pack()
+            self._restrict_to_label_chars(var)
+            self._detach_ime(entry)
+            self._part_cells.append(cell)
             self._part_slots.append({"preview": preview, "var": var, "img": None, "parts": None})
 
-        right = ttk.LabelFrame(body, text="蒐集進度")
-        right.grid(row=0, column=1, sticky="nsew")
+        self._parts_columns = 0
+        self._parts_grid.bind("<Configure>", self._reflow_part_cells)
+        self._reflow_part_cells()
+
+        progress = CollapsibleSection(
+            frame, "蒐集進度",
+            "看還缺哪些點數/花色，以及刪掉不要的樣板檔。", expanded=False)
+        progress.pack(fill=tk.X, padx=10, pady=(6, 0))
+        self.tmpl_section = progress
+        right = progress.body
 
         self.tmpl_progress = ttk.Label(right, text="", font=("Microsoft JhengHei", 10, "bold"),
-                                       wraplength=240, justify="left")
-        self.tmpl_progress.pack(anchor="w", padx=10, pady=(8, 2))
+                                       wraplength=420, justify="left")
+        self.tmpl_progress.pack(anchor="w", padx=10, pady=(8, 2), fill=tk.X)
         self.tmpl_missing = tk.Text(right, height=3, wrap="word", state=tk.DISABLED,
                                     font=("Consolas", 9), background="#f7f7f7")
         self.tmpl_missing.pack(fill=tk.X, padx=10, pady=4)
 
         ttk.Label(right, text="已存在的樣板檔：").pack(anchor="w", padx=10, pady=(6, 2))
         list_wrap = ttk.Frame(right)
-        list_wrap.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 6))
-        self.tmpl_list = tk.Listbox(list_wrap, font=("Consolas", 9))
+        list_wrap.pack(fill=tk.X, padx=10, pady=(0, 6))
+        self.tmpl_list = tk.Listbox(list_wrap, font=("Consolas", 9), height=8)
         list_scroll = ttk.Scrollbar(list_wrap, command=self.tmpl_list.yview)
         self.tmpl_list.configure(yscrollcommand=list_scroll.set)
         self.tmpl_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         list_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        # 清單自己有捲軸，滾輪不要被外層的捲動區搶走
+        self._keep_wheel_local(self.tmpl_list)
 
         btns = ttk.Frame(right)
-        btns.pack(anchor="e", padx=10, pady=(0, 10))
+        btns.pack(anchor="w", padx=10, pady=(0, 10))
         ttk.Button(btns, text="刪除選取的樣板檔", command=self._delete_template).pack(side=tk.LEFT)
         ttk.Button(btns, text="清掉所有內建樣板", command=self._delete_bundled_templates).pack(
             side=tk.LEFT, padx=(6, 0))
+        ttk.Button(btns, text="清掉裁切壞的樣板", command=self._delete_junk_templates).pack(
+            side=tk.LEFT, padx=(6, 0))
 
-        body.columnconfigure(0, weight=3)
-        body.columnconfigure(1, weight=2)
-        body.rowconfigure(0, weight=1)
+    def _reflow_part_cells(self, _event=None) -> None:
+        """依目前寬度決定六格排成幾欄。視窗縮小就換行，不會被切掉。"""
+        width = self._parts_grid.winfo_width()
+        if width <= 1:                     # 還沒 layout 過，先用一整排
+            columns = len(self._part_cells)
+        else:
+            columns = max(1, min(len(self._part_cells), width // self._PART_CELL_WIDTH))
+        if columns == self._parts_columns:
+            return                          # 欄數沒變就不要重排（Configure 會連發）
+        self._parts_columns = columns
+        for index, cell in enumerate(self._part_cells):
+            cell.grid(row=index // columns, column=index % columns,
+                      padx=2, pady=4, sticky="n")
+
+    # ------------------------------------------------- 代號輸入框
+
+    def _restrict_to_label_chars(self, var: tk.StringVar) -> None:
+        """代號欄只吃英數字，小寫自動變大寫，全形自動折成半角。
+
+        用 trace 而不是 validatecommand：validate 只能「接受或拒絕」，沒辦法把
+        使用者打的小寫改成大寫；而中文輸入法是「一次上一整串字」，
+        攔在變數層最乾淨 —— 貼上、輸入法上字、程式自己 set，三種都涵蓋。
+
+        正規化是 idempotent 的（normalize(normalize(x)) == normalize(x)），
+        所以「改完再觸發一次 trace」最多只會多跑一輪就停，不會無限遞迴。
+        """
+        def on_write(*_args):
+            current = var.get()
+            cleaned = normalize_label_input(current)
+            if cleaned != current:
+                var.set(cleaned)
+
+        var.trace_add("write", on_write)
+
+    def _detach_ime(self, widget: tk.Widget) -> None:
+        """在這個輸入框上關掉輸入法（只有 Windows 有效）。
+
+        症狀：每次按「讀取目前畫面」，焦點移到代號欄，Windows 就把輸入法切回
+        中文 —— 剛剛用 Shift 切成英文的狀態**不會跟著焦點走**，所以每抓一輪牌
+        都要重切一次。
+
+        `ImmAssociateContext(hwnd, 0)` 把這個視窗跟輸入法解除關聯，之後打什麼
+        字就直接進來，跟輸入法目前是中文還是英文完全無關。焦點回來時再做一次，
+        因為 Tk 重建視窗（unmap/map）會讓關聯復原。
+
+        失敗就安靜跳過（不是 Windows、或 Tk 沒給這個 widget 自己的 HWND）——
+        上面那層 trace 仍然會把非英數字擋掉，只是使用者得自己切輸入法。
+        """
+        if os.name != "nt":
+            return
+
+        def detach(_event=None):
+            try:
+                import ctypes
+                ctypes.windll.imm32.ImmAssociateContext(widget.winfo_id(), 0)
+            except Exception:   # noqa: BLE001
+                pass            # 這只是便利功能，絕對不值得讓 GUI 起不來
+
+        detach()
+        widget.bind("<FocusIn>", detach, add="+")
 
     # ---------- 設定 ----------
 
@@ -537,33 +758,37 @@ class HoloToolGUI(tk.Tk):
                   foreground="#555", wraplength=560, justify="left").pack(
                       anchor="w", padx=10, pady=8)
 
-        box = ttk.Frame(frame)
-        box.pack(fill=tk.X, padx=10)
-
         self.setting_vars: dict[str, tk.StringVar] = {}
-        for row, (key, name, hint) in enumerate(SETTING_FIELDS):
-            ttk.Label(box, text=name).grid(row=row, column=0, sticky="w", padx=4, pady=4)
-            try:
-                current = get_by_path(self.cfg, key)
-            except (KeyError, IndexError, TypeError):
-                current = ""
-            var = tk.StringVar(value=str(current))
-            self.setting_vars[key] = var
-            entry = ttk.Entry(box, textvariable=var, width=12)
-            entry.grid(row=row, column=1, padx=4, pady=4)
-            self._allow_numpad_decimal(entry)
-            ttk.Label(box, text=hint, foreground="#777", wraplength=380,
-                      justify="left").grid(row=row, column=2, sticky="w", padx=8)
-        box.columnconfigure(2, weight=1)
+        self.setting_sections: dict[str, CollapsibleSection] = {}
 
+        for title, subtitle, fields, expanded in SETTING_SECTIONS:
+            section = CollapsibleSection(frame, title, subtitle, expanded=expanded)
+            section.pack(fill=tk.X, padx=10, pady=(6, 0))
+            self.setting_sections[title] = section
+            self._build_setting_rows(section.body, fields)
+
+        # 其餘欄位直接攤開。一定要有自己的標題 —— 不然它們緊接在收合起來的
+        # 「動作時間設定」下面，看起來像是那一區的內容。
+        ttk.Label(frame, text="其他設定", font=("Microsoft JhengHei", 10, "bold")).pack(
+            anchor="w", padx=12, pady=(14, 0))
+        box = ttk.Frame(frame)
+        box.pack(fill=tk.X, padx=26, pady=(4, 0))
+        self._build_setting_rows(box, OTHER_FIELDS)
+
+        # 分組之後多了一種很難發現的壞法：欄位在完整清單裡、但沒有被任何一區畫出來，
+        # 於是它在畫面上不存在、存檔時也不會被寫。這裡直接對一次帳。
+        missing = [key for key, _n, _h in SETTING_FIELDS if key not in self.setting_vars]
+        if missing:
+            logger.log(f"[警告] 這些設定欄位沒有被畫出來，存檔時會被忽略：{missing}")
+
+        opt_box = ttk.Frame(frame)
+        opt_box.pack(fill=tk.X, padx=26)
         self.ace_high_var = tk.BooleanVar(value=bool(self.cfg.get("ace_high", True)))
         self.failsafe_var = tk.BooleanVar(value=bool(self.cfg.get("pyautogui_failsafe", True)))
-        opt_row = len(SETTING_FIELDS)
-        ttk.Checkbutton(box, text="比大小時 A 視為最大牌", variable=self.ace_high_var).grid(
-            row=opt_row, column=0, columnspan=3, sticky="w", padx=4, pady=4)
-        ttk.Checkbutton(box, text="啟用滑鼠移到螢幕角落緊急中止（建議開啟）",
-                        variable=self.failsafe_var).grid(
-            row=opt_row + 1, column=0, columnspan=3, sticky="w", padx=4, pady=4)
+        ttk.Checkbutton(opt_box, text="比大小時 A 視為最大牌",
+                        variable=self.ace_high_var).pack(anchor="w", padx=4, pady=4)
+        ttk.Checkbutton(opt_box, text="啟用滑鼠移到螢幕角落緊急中止（建議開啟）",
+                        variable=self.failsafe_var).pack(anchor="w", padx=4, pady=4)
 
         ttk.Label(frame,
                   text="小數點打不進去的話（中文輸入法常會吃掉數字鍵盤那顆「.」），"
@@ -576,6 +801,24 @@ class HoloToolGUI(tk.Tk):
         ttk.Button(btn_row, text="儲存設定", command=self._save_settings).pack(side=tk.LEFT)
         ttk.Button(btn_row, text="全部還原成預設值",
                    command=self._reset_settings_to_default).pack(side=tk.LEFT, padx=(8, 0))
+
+    def _build_setting_rows(self, parent, fields) -> None:
+        """把一組 (key, 名稱, 說明) 排成三欄。所有 StringVar 都收進 setting_vars，
+        存檔與「還原預設值」不必知道欄位被分到哪一區。"""
+        for row, (key, name, hint) in enumerate(fields):
+            ttk.Label(parent, text=name).grid(row=row, column=0, sticky="w", padx=4, pady=4)
+            try:
+                current = get_by_path(self.cfg, key)
+            except (KeyError, IndexError, TypeError):
+                current = ""
+            var = tk.StringVar(value=str(current))
+            self.setting_vars[key] = var
+            entry = ttk.Entry(parent, textvariable=var, width=12)
+            entry.grid(row=row, column=1, padx=4, pady=4)
+            self._allow_numpad_decimal(entry)
+            ttk.Label(parent, text=hint, foreground="#777", wraplength=380,
+                      justify="left").grid(row=row, column=2, sticky="w", padx=8)
+        parent.columnconfigure(2, weight=1)
 
     def _allow_numpad_decimal(self, entry: tk.Widget) -> None:
         """讓數字鍵盤那顆小數點在中文輸入法下也能用。
@@ -648,14 +891,13 @@ class HoloToolGUI(tk.Tk):
         # 結果是把視窗調成別的長寬比、按一下「使用此視窗」，長寬比警告就消失了，
         # 而所有框選其實還是上一個比例的值。沉默地壞掉比報錯難查得多。
         # 校準尺寸只有在真的重新框選（_run_calibration）時才該更新。
-        try:
-            rect = win_mod.get_client_rect_on_screen(self._windows[idx][0])
-            selection = profiles_mod.select_for_window(self.cfg, rect.width, rect.height)
-            logger.log(profiles_mod.summarize_selection(selection))
-        except Exception:
-            pass
         save_config(self.cfg)
         logger.log(f"已設定遊戲視窗：{title}")
+        # 選好視窗的那一刻就把比例抓出來、套上對應的那組校準。
+        # 沒有對應的那一組時 select_for_window() 會從最接近的**精確換算**一組出來
+        # （遊戲的 UI 排在置中的 16:9 內容框裡，換算是像素級精確的）。
+        self._detected_size = None
+        self._autodetect_profile()
         self._update_window_status()
 
     def _find_hwnd(self) -> int | None:
@@ -851,35 +1093,140 @@ class HoloToolGUI(tk.Tk):
 
     # ------------------------------------------------- 長寬比校準組
 
+    AUTO_CHOICE = "自動偵測（建議）"
+
+    def _client_size(self) -> tuple[int, int] | None:
+        hwnd = self._find_hwnd()
+        if hwnd is None:
+            return None
+        try:
+            rect = win_mod.get_client_rect_on_screen(hwnd)
+        except Exception:  # noqa: BLE001
+            return None
+        if rect.width <= 0 or rect.height <= 0:
+            return None
+        return rect.width, rect.height
+
+    def _autodetect_profile(self, force: bool = False, announce: bool = True) -> None:
+        """依視窗當下的尺寸挑（或換算出）對應比例的校準並套用。
+
+        `force=False` 時只在尺寸真的變了、**而且已經穩定下來**才做事：
+
+        * 每次都重跑 select_for_window 等於每兩秒寫一次 config.json。
+        * 更重要的是，慢慢用滑鼠把視窗拖大的過程會經過一堆怪比例（2.08:1、
+          1.95:1…），每一種都會生出一組換算來的 profile，把 profile 數量頂到上限
+          之後就開始淘汰。所以要等「連續兩次量到同一個尺寸」才動作 ——
+          拖曳過程中的中間值不會留下任何東西。
+
+        使用者手動指定過比例（`auto_detect_profile` = False）就完全不介入，
+        除非他自己按「重新偵測」（那顆會 force=True 並把自動偵測打開）。
+        """
+        size = self._client_size()
+        if size is None:
+            return
+        if force:
+            self.cfg["auto_detect_profile"] = True
+        elif not self.cfg.get("auto_detect_profile", True):
+            return
+        elif size == getattr(self, "_detected_size", None):
+            self._settling_size = None
+            return
+        elif size != getattr(self, "_settling_size", None):
+            self._settling_size = size    # 還在拖，下次再看看有沒有停下來
+            return
+
+        self._settling_size = None
+        self._detected_size = size
+        try:
+            selection = profiles_mod.select_for_window(self.cfg, size[0], size[1])
+        except Exception as e:  # noqa: BLE001
+            logger.log(f"[警告] 自動偵測視窗比例失敗：{e!r}")
+            return
+        save_config(self.cfg)
+        if announce or selection.get("switched"):
+            logger.log(f"視窗 {size[0]}x{size[1]} → " + profiles_mod.summarize_selection(selection))
+            if selection.get("switched") and self.bot is not None and self.bot.running:
+                logger.log("[注意] 執行中換了校準組。若點擊位置變得不準，請停止後重新啟動。")
+        self._refresh_calib_status()
+        self._update_window_status()
+
+    def _on_profile_choice(self, _event=None) -> None:
+        """使用者從下拉選單手動指定比例。
+
+        手動指定之後就關掉自動偵測 —— 不然視窗尺寸一變（或下次啟動）馬上就被
+        自動偵測改回去，使用者會覺得這個選單根本沒用。
+        """
+        choice = self.profile_combo.get()
+        if choice == self.AUTO_CHOICE:
+            # 先存檔再偵測：遊戲沒開的時候 _autodetect_profile() 量不到尺寸會直接
+            # 返回，如果把「打開自動偵測」交給它做，這個選擇就悄悄不見了 ——
+            # 下一次 _refresh_profiles() 還會把選單跳回原本那一組。
+            self.cfg["auto_detect_profile"] = True
+            save_config(self.cfg)
+            self._detected_size = None
+            self._autodetect_profile(force=True)
+            logger.log("視窗比例已改回自動偵測")
+            self._refresh_profiles()
+            return
+        profile = profiles_mod.find_by_label(self.cfg, choice)
+        if profile is None:
+            return
+        self.cfg["auto_detect_profile"] = False
+        profiles_mod.activate(self.cfg, profile)
+        save_config(self.cfg)
+        logger.log(f"已手動指定使用「{choice}」的校準（自動偵測已關閉，"
+                   "要恢復請把下拉選單改回「自動偵測」）")
+        self._refresh_calib_status()
+        self._update_window_status()
+
     def _refresh_profiles(self) -> None:
         if not hasattr(self, "profile_status"):
             return
         lines = profiles_mod.describe(self.cfg)
         labels = [p.get("label", "?") for p in profiles_mod.get_profiles(self.cfg)]
-        self.profile_combo.config(values=labels)
-        if labels and not self.profile_combo.get():
-            self.profile_combo.set(self.cfg.get("active_profile") or labels[0])
+        auto = bool(self.cfg.get("auto_detect_profile", True))
+        self.profile_combo.config(values=[self.AUTO_CHOICE] + labels)
+        wanted = self.AUTO_CHOICE if auto else (self.cfg.get("active_profile") or "")
+        if self.profile_combo.get() != wanted:
+            self.profile_combo.set(wanted)
 
-        hwnd = self._find_hwnd()
         head = ""
-        if hwnd is not None:
-            try:
-                rect = win_mod.get_client_rect_on_screen(hwnd)
-                label = profiles_mod.label_for(rect.width, rect.height)
-                match, delta = profiles_mod.find_match(
-                    self.cfg, rect.width, rect.height,
-                    self.cfg.get("aspect_ratio_tolerance", 0.02))
-                tolerance = self.cfg.get("aspect_ratio_tolerance", 0.02)
-                if match is not None and delta <= tolerance:
-                    head = f"目前視窗 {rect.width}x{rect.height} = {label}，使用「{match.get('label')}」這一組\n"
-                else:
-                    borrowed = match.get("label") if match else "（無）"
-                    head = (f"目前視窗 {rect.width}x{rect.height} = {label}，"
-                            f"沒有這個比例的校準，正借用「{borrowed}」\n")
-            except Exception:
-                head = ""
+        size = self._client_size()
+        if size is not None:
+            width, height = size
+            label = profiles_mod.label_for(width, height)
+            tolerance = self.cfg.get("aspect_ratio_tolerance", 0.02)
+            match, delta = profiles_mod.find_match(self.cfg, width, height, tolerance)
+            mode = "自動偵測" if auto else "手動指定"
+            if not auto:
+                head = (f"{mode}：使用「{self.cfg.get('active_profile') or '（無）'}」這一組"
+                        f"（目前視窗 {width}x{height} = {label}）\n")
+            elif match is not None and delta <= tolerance:
+                head = f"{mode}：目前視窗 {width}x{height} = {label}，使用「{match.get('label')}」這一組\n"
+            else:
+                borrowed = match.get("label") if match else "（無）"
+                head = (f"{mode}：目前視窗 {width}x{height} = {label}，"
+                        f"還沒有這個比例的校準（最接近的是「{borrowed}」）\n")
         body = "\n".join(f"　• {line}" for line in lines) if lines else "　（還沒有任何校準組）"
         self.profile_status.config(text=head + body)
+        self._refresh_calib_banner()
+
+    def _refresh_calib_banner(self) -> None:
+        """校準分頁上方那一行：現在校準的是哪一組。"""
+        if not hasattr(self, "calib_profile_banner"):
+            return
+        active = self.cfg.get("active_profile")
+        cal = self.cfg.get("calibration") or {}
+        width, height = cal.get("client_width") or 0, cal.get("client_height") or 0
+        size = f"{width}x{height}" if width and height else "尺寸未紀錄"
+        if active:
+            text = f"正在校準：{active}（量於 {size}）　—　框選結果只會寫進這一組"
+        else:
+            pending = self.cfg.get(profiles_mod.PENDING_LABEL_KEY)
+            text = (f"正在校準：{pending or '未知比例'}（{size}，尚未建立校準組，"
+                    "存檔時會自動建立）")
+        self.calib_profile_banner.config(
+            text=text + "　—　比例的偵測與切換在「主控台」分頁")
 
     def _save_profile_for_current(self) -> None:
         hwnd = self._find_hwnd()
@@ -909,8 +1256,11 @@ class HoloToolGUI(tk.Tk):
 
     def _delete_selected_profile(self) -> None:
         label = self.profile_combo.get()
+        if label == self.AUTO_CHOICE:
+            # 下拉選單停在「自動偵測」時，要刪的是目前正在生效的那一組
+            label = self.cfg.get("active_profile") or ""
         if not label:
-            messagebox.showinfo("尚未選擇", "請先從旁邊的清單選一組要刪除的比例。")
+            messagebox.showinfo("尚未選擇", "請先從下拉選單選一組要刪除的比例。")
             return
         if not messagebox.askyesno(
             "刪除校準組？",
@@ -920,10 +1270,46 @@ class HoloToolGUI(tk.Tk):
             return
         if profiles_mod.remove(self.cfg, label):
             save_config(self.cfg)
-            self.profile_combo.set("")
+            # 刪掉的可能就是生效中的那一組，回到自動偵測重新挑一組來用，
+            # 否則畫面上會停在「沒有生效中的校準」這種半死狀態。
+            self.cfg["auto_detect_profile"] = True
+            self._detected_size = None
+            self._autodetect_profile()
             self._refresh_profiles()
             self._update_window_status()
             logger.log(f"已刪除「{label}」的校準組。")
+
+    # --------------------------------------------------- 校準的圖示提示
+
+    def _calib_example(self, path: str):
+        """這一項的範例圖（PIL Image）。做不出來就回 None，校準照舊能跑。
+
+        範例圖只是提示，任何一步失敗（檔案缺了、PIL 出問題）都不該讓校準中斷 ——
+        使用者正在對著遊戲畫面等，這時候丟一個例外是最糟的結果。
+        """
+        try:
+            return calibguide.example_image(path)
+        except Exception as e:  # noqa: BLE001
+            logger.log(f"[提示] 讀取「{path}」的範例圖失敗，改用純文字說明：{e!r}")
+            return None
+
+    def _calib_guide_rect(self, kind: str, path: str, rect) -> dict | None:
+        """把建議座標換算成螢幕絕對座標，交給遮罩畫成虛線框／十字。"""
+        try:
+            value = calibguide.suggested_value(self.cfg, path)
+            if not value:
+                return None
+            if kind == "region":
+                x, y, w, h = ratio_region_to_pixels(value, rect.width, rect.height)
+                return {"kind": "region", "rect": (rect.left + x, rect.top + y, w, h)}
+            x, y = ratio_point_to_pixels(value, rect.width, rect.height)
+            radius = max(14, round(rect.width * 0.018))
+            return {"kind": "point",
+                    "rect": (rect.left + x - radius, rect.top + y - radius,
+                             radius * 2, radius * 2)}
+        except Exception as e:  # noqa: BLE001
+            logger.log(f"[提示] 算不出「{path}」的建議位置，只顯示文字說明：{e!r}")
+            return None
 
     def _run_calibration(self, targets: list[tuple[str, str, str, str, str]]) -> None:
         hwnd = self._find_hwnd()
@@ -961,9 +1347,19 @@ class HoloToolGUI(tk.Tk):
                 time.sleep(0.2)
                 rect = win_mod.get_client_rect_on_screen(hwnd)
 
+                example = self._calib_example(path)
+                guide = self._calib_guide_rect(kind, path, rect)
                 instruction = f"【第 {index}/{total} 項】{name}\n{hint}"
+                if example is None:
+                    instruction += "\n（這一項沒有內建範例圖，請照上面的文字說明框選）"
                 picker = select_region if kind == "region" else select_point
-                result = picker(instruction, self)
+                result = picker(
+                    instruction, self,
+                    example=example,
+                    example_caption=calibguide.caption_for(path),
+                    guide=guide,
+                    window_rect=(rect.left, rect.top, rect.width, rect.height),
+                )
             except Exception as e:  # noqa: BLE001
                 logger.log(f"[錯誤] 校準「{name}」時發生問題：{e!r}")
                 self._safe_restore_window()
@@ -1101,6 +1497,47 @@ class HoloToolGUI(tk.Tk):
         out.append(("highlow", self.cfg["regions"].get("highlow_card", {})))
         return out
 
+    def _looks_like_highlow(self, capture, reader) -> bool:
+        """現在畫面上是「比大小」還是「選牌」？
+
+        刻意**不用**畫面標記的分數來判斷。使用者的標記樣板還是 1024 寬的內建圖，
+        分數常常在門檻邊緣徘徊（實機 log：選牌 37%、失敗 49%）——
+        拿一個本身就不可靠的訊號來決定要讀哪幾格，只會把問題往下傳。
+
+        改用「哪一組真的切得出牌角」這個直接證據：選牌畫面五格通常有 4~5 格
+        切得出來；比大小畫面的手牌框壓在淺色面板上，最多誤中一兩格。
+        所以三格以上成功就當成選牌畫面。
+        """
+        hand_hits = 0
+        for _name, region in self._slot_regions()[:5]:
+            if not region or region.get("w", 0) <= 0:
+                continue
+            try:
+                roi = capture.grab_region(region)
+            except Exception:
+                continue
+            h, w = roi.shape[:2]
+            try:
+                if extract_parts(roi, w, h) is not None:
+                    hand_hits += 1
+            except Exception:
+                continue
+        if hand_hits >= 3:
+            return False
+
+        region = self.cfg["regions"].get("highlow_card", {})
+        if not region or region.get("w", 0) <= 0:
+            return False
+        try:
+            roi = capture.grab_region(region)
+        except Exception:
+            return False
+        h, w = roi.shape[:2]
+        try:
+            return rightmost_card_rect(roi, w, h) is not None
+        except Exception:
+            return False
+
     def _capture_parts(self) -> None:
         capture = GameCapture(self.cfg.get("window_title_substring", ""))
         if not capture.locate():
@@ -1115,11 +1552,27 @@ class HoloToolGUI(tk.Tk):
         templates = load_part_templates()
         reader = CardReader(part_templates=templates)
         found = 0
-        for slot, (_name, region) in zip(self._part_slots, self._slot_regions()):
+        # 「手牌 1~5」與「比大小」不可能同時出現在畫面上：前者只在選牌畫面、
+        # 後者只在比大小畫面。舊版不管在哪個畫面都把六格全部讀一遍，於是
+        # **永遠有一半是垃圾** —— 在選牌畫面時「比大小」那格會去讀牌桌背景或
+        # 別人的牌角，在比大小畫面時五格手牌全是背景。
+        #
+        # 使用者填好正確的那幾格按「全部儲存」，垃圾那格如果也被填了就一起存進去，
+        # 這正是 card_templates/parts 裡那幾個「只切到一小角」的廢檔的來源，
+        # 也是他看到「位子看起來太偏」警告的原因（警告本身是對的，錯在讀了不該讀的格子）。
+        #
+        # 所以先判斷「現在是哪個畫面」，只填那一組，另一組明確標成「非此畫面」。
+        on_highlow = self._looks_like_highlow(capture, reader)
+        for index, (slot, (_name, region)) in enumerate(
+                zip(self._part_slots, self._slot_regions())):
             slot["parts"] = None
             slot["img"] = None
             slot["var"].set("")
             slot["preview"].config(image="", text="—")
+            wanted = (_name == "highlow") if on_highlow else (_name != "highlow")
+            if not wanted:
+                slot["preview"].config(text="非此畫面")
+                continue
             if not region or region.get("w", 0) <= 0:
                 continue
             try:
@@ -1152,11 +1605,17 @@ class HoloToolGUI(tk.Tk):
             slot["img"] = photo          # 保住參考，否則會被回收變空白
             slot["preview"].config(image=photo, text="")
 
-        self.parts_hint.config(text=f"讀到 {found} 張；確認代號後按「全部儲存」")
+        screen = "比大小畫面" if on_highlow else "選牌畫面"
+        other = "手牌 1~5" if on_highlow else "比大小"
+        self.parts_hint.config(
+            text=f"偵測到「{screen}」，讀到 {found} 張；確認代號後按「全部儲存」。"
+                 f"（{other} 那幾格標成「非此畫面」是正常的 —— 兩個畫面不會同時出現，"
+                 "硬讀只會存到垃圾樣板）")
 
     def _save_parts(self) -> None:
         saved = 0
         skipped: list[str] = []
+        written: list[str] = []
         os.makedirs(PARTS_DIR, exist_ok=True)
         for slot in self._part_slots:
             parts = slot.get("parts")
@@ -1175,27 +1634,41 @@ class HoloToolGUI(tk.Tk):
             if parts["is_red"] != (suit in "HD"):
                 skipped.append(f"{label}（顏色對不上：畫面上是{'紅' if parts['is_red'] else '黑'}色）")
                 continue
-            saved += self._write_part("rank", rank, parts["rank"])
-            saved += self._write_part("suit", suit, parts["suit"])
+            saved += self._write_part("rank", rank, parts["rank"], written)
+            saved += self._write_part("suit", suit, parts["suit"], written)
             if rank not in ("J", "Q", "K") and parts.get("pip") is not None:
-                saved += self._write_part("pip", suit, parts["pip"])
+                saved += self._write_part("pip", suit, parts["pip"], written)
             # 右下角那一組（轉正過的）也存起來：同一張牌的第二次取樣，
             # 讓 2/5/8、黑桃/梅花這種容易打結的組合多一份參考
             if parts.get("rank2") is not None:
-                saved += self._write_part("rank", rank, parts["rank2"])
+                saved += self._write_part("rank", rank, parts["rank2"], written)
             if parts.get("suit2") is not None:
-                saved += self._write_part("suit", suit, parts["suit2"])
+                saved += self._write_part("suit", suit, parts["suit2"], written)
         if saved:
             logger.log(f"已新增 {saved} 個點數/花色樣板")
+        # 剛存進去的有沒有裁壞？以前這件事完全不講，載入時安靜跳過就算了 ——
+        # 結果使用者存了 5 個「只切到花色一角」的小點，一直以為自己有樣板，
+        # 而那正是方塊被認成愛心的原因。現在當場講。
+        fresh_junk = [n for n, _cov in unusable_parts(PARTS_DIR) if n in written]
+        if fresh_junk:
+            messagebox.showwarning(
+                "這次有幾張裁切壞了",
+                "下面這幾張只切到符號的一小角，**不會被拿來比對**：\n\n"
+                + "  ".join(fresh_junk)
+                + "\n\n通常是校準的手牌框沒對準這個視窗比例。\n"
+                  "請確認主控台的「視窗比例」正確，或在「校準」分頁重新框選手牌區域，"
+                  "再重新抓一次。\n\n"
+                  "（壞掉的檔案留在磁碟上沒有刪，可以用「清掉裁切壞的樣板」一次清掉。）")
         if skipped:
             messagebox.showwarning("有幾格沒存", "\n".join(skipped))
-        elif not saved:
+        elif not saved and not fresh_junk:
             messagebox.showinfo("沒有東西可存", "請先按「讀取目前畫面」，並填好代號。")
         self._refresh_template_panel()
 
     _MAX_PER_LABEL = 8
 
-    def _write_part(self, kind: str, key: str, image) -> int:
+    def _write_part(self, kind: str, key: str, image,
+                    written: Optional[list] = None) -> int:
         """存一個點數/花色小樣板。上限**只算你自己抓的**，內建的不佔位子。
 
         這裡曾經有一個很難發現的 bug：內建樣板每個花色都剛好 8 張
@@ -1216,6 +1689,8 @@ class HoloToolGUI(tk.Tk):
             except OSError:
                 pass
         cv2.imwrite(path, image)
+        if written is not None:
+            written.append(os.path.basename(path))
         return 1
 
     def _delete_template(self) -> None:
@@ -1234,10 +1709,14 @@ class HoloToolGUI(tk.Tk):
         self._refresh_template_panel()
 
     def _bundled_filenames(self) -> set:
-        src = default_parts_dir()
-        if not os.path.isdir(src):
-            return set()
-        return {n for n in os.listdir(src) if n.lower().endswith(".png")}
+        """`parts/` 裡「內容真的還是內建樣板」的檔名。
+
+        **不可以只比檔名。** 內建檔叫 suit_D_1.png，而使用者自己抓的樣板也可能
+        被寫進同一個檔名（見 cardparts.is_bundled_copy 的說明）——
+        只比檔名的話，「清掉所有內建樣板」會把他自己抓的 19 個一起刪掉，
+        而按鈕上明明寫著「你自己抓的不會動」。
+        """
+        return set(bundled_copies_present(PARTS_DIR, default_parts_dir()))
 
     def _delete_bundled_templates(self) -> None:
         """把還留在 card_templates/parts 的內建樣板一次清掉。
@@ -1245,9 +1724,7 @@ class HoloToolGUI(tk.Tk):
         內建樣板是從縮圖放大來的，比實機糊一圈，是「2/5/8 一直問號」「黑桃梅花
         分不清」的主因。有自己的樣板之後程式會自動不用內建的，但整組刪掉更乾淨。
         """
-        bundled = self._bundled_filenames()
-        present = [n for n in sorted(os.listdir(PARTS_DIR))
-                   if n in bundled] if os.path.isdir(PARTS_DIR) else []
+        present = bundled_copies_present(PARTS_DIR, default_parts_dir())
         if not present:
             messagebox.showinfo("沒有內建樣板", "目前的樣板全部都是你自己抓的，不用清。")
             return
@@ -1276,10 +1753,38 @@ class HoloToolGUI(tk.Tk):
         logger.log(f"已清除 {removed} 個內建樣板")
         self._refresh_template_panel()
 
+    def _delete_junk_templates(self) -> None:
+        """刪掉「只切到符號一角」的樣板檔。
+
+        這些檔案載入時本來就會被跳過（`part_is_usable`），留著不影響辨識，
+        但會讓「我有 3 張樣板」的印象跟「實際只有 1 張能用」對不起來 ——
+        使用者就是這樣一路以為自己有在累積樣板的。
+        """
+        junk = unusable_parts(PARTS_DIR)
+        if not junk:
+            messagebox.showinfo("沒有壞掉的樣板", "每一張樣板都切得好好的，不用清。")
+            return
+        listing = "\n".join(f"  {n}（只佔 {cov:.0%}）" for n, cov in junk)
+        if not messagebox.askyesno(
+            "確認刪除",
+            f"要刪掉這 {len(junk)} 個裁切壞掉的樣板嗎？\n\n{listing}\n\n"
+            "它們現在也沒有被拿來比對，刪掉只是讓數量對得上。\n"
+            "刪完之後請重新抓一次那幾個花色／點數。",
+        ):
+            return
+        removed = 0
+        for name, _cov in junk:
+            try:
+                os.remove(os.path.join(PARTS_DIR, name))
+                removed += 1
+            except OSError:
+                pass
+        logger.log(f"已刪除 {removed} 個裁切壞掉的樣板")
+        self._refresh_template_panel()
+
     def _refresh_template_panel(self) -> None:
         templates = load_part_templates()
         miss_rank, miss_suit = missing_parts(templates)
-        sources = part_sources()
         n_rank = len(templates.get("rank") or {})
         n_suit = len(templates.get("suit") or {})
         n_pip = len(templates.get("pip") or {})
@@ -1291,18 +1796,31 @@ class HoloToolGUI(tk.Tk):
             lines.append("還缺點數：" + "  ".join(miss_rank))
         if miss_suit:
             lines.append("還缺花色：" + "  ".join(miss_suit))
-        borrowed_rank = [r for r in RANKS if sources.get("rank", {}).get(r) is False]
-        borrowed_suit = [s for s in SUITS if sources.get("suit", {}).get(s) is False]
-        if borrowed_rank or borrowed_suit:
-            bits = []
-            if borrowed_rank:
-                bits.append("點數 " + " ".join(borrowed_rank))
-            if borrowed_suit:
-                bits.append("花色 " + " ".join(borrowed_suit))
-            lines.append("還在用內建樣板（內建是縮圖放大的，比較容易認錯）：" + "；".join(bits))
-            lines.append("　→ 抓一次自己的，程式就會自動改用你的，內建的那組會被忽略。")
+
+        # 每個標籤實際的樣板數量。以前這裡只顯示「有沒有自己的樣板」，
+        # 於是「有 3 個檔案但 2 個是裁壞的小點、真正拿來比對只有 1 張」
+        # 這種狀況完全看不出來 —— 而那正是方塊被認成愛心的原因。
+        inventory = part_inventory(PARTS_DIR, default_parts_dir())
+        thin, junky = [], []
+        for kind, title in (("rank", "點數"), ("suit", "花色"), ("pip", "中央大圖案")):
+            for key in sorted(inventory.get(kind, {}), key=lambda k: (len(k), k)):
+                row = inventory[kind][key]
+                if row["own"] < MIN_OWN_TO_DROP_BUNDLED:
+                    thin.append(f"{title}{key}({row['own']}/{MIN_OWN_TO_DROP_BUNDLED})")
+                if row["junk"]:
+                    junky.append(f"{title}{key}×{row['junk']}")
+        if thin:
+            lines.append(f"自己抓的樣板還不到 {MIN_OWN_TO_DROP_BUNDLED} 張的："
+                         + "  ".join(thin))
+            lines.append("　→ 這些會「你的 + 內建」混著比對。抓滿之後程式就只用你的，"
+                         "辨識率明顯提升。")
+        if junky:
+            lines.append("⚠ 有裁切壞掉的樣板（只切到符號一角，不會拿來比對）："
+                         + "  ".join(junky))
+            lines.append("　→ 按下面的「清掉裁切壞的樣板」刪掉，再重新抓一次。")
         if not lines:
-            lines.append("已經蒐集齊全，而且全部都是你自己抓的樣板，52 張牌都認得出來了！")
+            lines.append("已經蒐集齊全，而且每個標籤都有足夠的自己抓的樣板，"
+                         "52 張牌都認得出來了！")
         lines.append("（中央大圖案是數字牌中間那個大花色，用來把黑桃跟梅花分清楚，"
                      "存數字牌時會自動一起存。）")
         self.tmpl_missing.config(state=tk.NORMAL)
@@ -1311,17 +1829,23 @@ class HoloToolGUI(tk.Tk):
         self.tmpl_missing.config(state=tk.DISABLED)
 
         bundled = self._bundled_filenames()
+        junk_files = dict(unusable_parts(PARTS_DIR))
         self.tmpl_list.delete(0, tk.END)
         if os.path.isdir(PARTS_DIR):
             for fname in sorted(os.listdir(PARTS_DIR)):
-                if fname.lower().endswith(".png"):
-                    tag = "（內建）" if fname in bundled else ""
-                    self.tmpl_list.insert(tk.END, fname + tag)
+                if not fname.lower().endswith(".png"):
+                    continue
+                if fname in junk_files:
+                    tag = f"　← 裁切壞掉（只佔 {junk_files[fname]:.0%}），不會用"
+                elif fname in bundled:
+                    tag = "（內建）"
+                else:
+                    tag = ""
+                self.tmpl_list.insert(tk.END, fname + tag)
 
     # ----------------------------------------------------------- 設定
 
-    _INT_SETTINGS = {"monte_carlo_samples", "highlow_max_chain", "exit_table_ticks",
-                     "daily_max_wins"}
+    _INT_SETTINGS = INT_SETTINGS
 
     # 全形句號、頓號、逗號、間隔號都當成小數點。
     #
@@ -1581,6 +2105,13 @@ class HoloToolGUI(tk.Tk):
 
         self._sync_buttons()
         self._refresh_stats()
+
+        # 每 4 次 pump（約兩秒）看一次視窗尺寸有沒有變。使用者把遊戲從 21:9
+        # 拉成 16:9 之後，不需要自己想起來要去按什麼按鈕。
+        self._detect_tick = (self._detect_tick + 1) % 4
+        if self._detect_tick == 0:
+            self._autodetect_profile(announce=False)
+
         self.after(500, self._pump)
 
     def _refresh_stats(self) -> None:
@@ -1595,6 +2126,40 @@ class HoloToolGUI(tk.Tk):
             text=(f"日期 {data.get('date', '-')}　已觀察牌數 {observed}　"
                   f"開始局數 {data.get('rounds_started', 0)}　比大小猜測 {guesses} 次")
         )
+
+    def _reconcile_stats(self) -> None:
+        """把 log 與其他安裝的統計檔裡「還沒算進機率模型」的牌補進來。
+
+        機率模型（`src/stats.py`）吃的是 card_counts，而那份計數只有在 bot 正常
+        跑到選牌／比大小時才會 +1。exe 版與原始碼版各有一份 data\\、只開即時辨識
+        看畫面、程式中途被關掉 —— 這幾種情況的牌都只留在 log 裡。
+        補進來之後今天的估計才會真的貼近今天的牌堆。
+        """
+        self.reconcile_btn.config(state=tk.DISABLED)
+        self.reconcile_status.config(text="正在檢查…", foreground="#555")
+        self.update_idletasks()
+        try:
+            report = reconcile_mod.reconcile(days=7, cfg=self.cfg)
+        except Exception as e:  # noqa: BLE001
+            self.reconcile_status.config(text=f"補算失敗：{e!r}", foreground="#c33")
+            logger.log(f"[錯誤] 補算未記錄的數值失敗：{e!r}")
+            return
+        finally:
+            self.reconcile_btn.config(state=tk.NORMAL)
+
+        summary = report.summary()
+        self.reconcile_status.config(
+            text=summary, foreground="#0a6" if report.total_added else "#777")
+        logger.log("[補算] " + summary)
+        if report.total_added:
+            self._refresh_stats()
+            messagebox.showinfo("已補算", summary + "\n\n機率模型下一局就會用新的數字。")
+        else:
+            messagebox.showinfo(
+                "無其餘資料",
+                "沒有找到還沒記錄到的牌。\n\n"
+                "檢查過：今天與前 6 天的執行紀錄、"
+                f"以及 {len(reconcile_mod.candidate_data_dirs(self.cfg))} 個其他 data 資料夾。")
 
     # ------------------------------------------------------- 檢查更新
 

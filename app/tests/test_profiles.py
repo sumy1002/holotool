@@ -256,5 +256,151 @@ class TestSaveAsAndRemove(unittest.TestCase):
         self.assertIsNotNone(pf.find_by_label(cfg, "21:9"))
 
 
+class TestEvictionOrder(unittest.TestCase):
+    """profile 數量到上限時，人工校準的那一組必須活到最後。
+
+    背景：主控台現在會自動偵測比例，把遊戲視窗慢慢拖大的過程會經過一堆怪比例
+    （2.08:1、1.95:1…），每一種都會生出一組**換算來的** profile。舊版的淘汰順序是
+    「seeded_from 的 → 最舊的」，而使用者手工校準的那組通常正好是最舊的第一組
+    —— 拖幾次視窗就足以把它擠掉，而且完全沒有徵兆。
+    """
+
+    def _profiles(self) -> list[dict]:
+        hand = pf._make_profile("21:9", 1843, 778, {"a": 1}, {"b": 2})
+        derived = pf._make_profile("16:9", 1600, 900, {}, {})
+        derived["derived_from"] = "21:9"
+        seeded = pf._make_profile("4:3", 1200, 900, {}, {}, seeded_from="21:9")
+        return [hand, derived, seeded]
+
+    def test_seeded_goes_first(self):
+        profiles = self._profiles()
+        self.assertEqual(pf._pick_victim(profiles, keep_label=None).get("label"), "4:3")
+
+    def test_derived_goes_before_hand_calibrated(self):
+        profiles = [p for p in self._profiles() if not p.get("seeded_from")]
+        self.assertEqual(pf._pick_victim(profiles, keep_label=None).get("label"), "16:9")
+
+    def test_hand_calibrated_survives_a_flood_of_derived_profiles(self):
+        profiles = [pf._make_profile("21:9", 1843, 778, {"a": 1}, {"b": 2})]
+        for i in range(pf.MAX_PROFILES + 5):
+            junk = pf._make_profile(f"{1.9 + i / 100:.2f}:1", 1900 + i, 1000, {}, {})
+            junk["derived_from"] = "21:9"
+            profiles.append(junk)
+            pf._enforce_limit(profiles, keep_label=junk["label"])
+        self.assertLessEqual(len(profiles), pf.MAX_PROFILES)
+        survivor = [p for p in profiles if p.get("label") == "21:9"]
+        self.assertEqual(len(survivor), 1, "手工校準的 21:9 被擠掉了")
+        self.assertEqual(survivor[0]["regions"], {"a": 1})
+
+    def test_keep_label_is_never_evicted(self):
+        profiles = self._profiles()
+        victim = pf._pick_victim(profiles, keep_label="4:3")
+        self.assertNotEqual(victim.get("label"), "4:3")
+
+    def test_nothing_to_evict_returns_none(self):
+        only = pf._make_profile("21:9", 1843, 778, {}, {})
+        self.assertIsNone(pf._pick_victim([only], keep_label="21:9"))
+
+
+class TestSameLabelDifferentAspect(unittest.TestCase):
+    """好唸的名字容許 4%，共用校準只容許 2% —— 中間那一段不可以吃掉人工校準。
+
+    `label_for` 的 LABEL_TOLERANCE 是 0.04，`find_match` 用的 tolerance 是 0.02。
+    所以有一段尺寸會拿到「跟現有那組同名、但其實是另一種比例」的標籤，而
+    `select_for_window` 原本是「同名就丟掉」——手工校準的成果會被一組換算來的
+    悄悄取代，而且完全沒有徵兆。
+
+    實例：手工校準的 21:9 是 1937x817（2.3708）。視窗變成 3420x1500（2.28）時，
+    label_for 仍然叫它「21:9」（差 2.3%，命名範圍內），但跟 2.3708 差 3.83%
+    （超過共用範圍）。主控台改成「尺寸一變就自動偵測」之後這條路很容易踩到。
+    """
+
+    HAND = (1937, 817)          # 使用者手工校準的 21:9
+    CLASH = (3420, 1500)        # 也叫 21:9，但比例差 3.83%
+
+    def _cfg(self) -> dict:
+        cfg = {
+            "aspect_ratio_tolerance": 0.02,
+            "regions": {"table_marker": {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4}},
+            "points": {"high_button": {"x": 0.75, "y": 0.46}},
+            "calibration": {"client_width": self.HAND[0], "client_height": self.HAND[1]},
+            "calibration_profiles": [],
+            "active_profile": None,
+        }
+        pf.ensure_profiles(cfg)
+        return cfg
+
+    def test_the_two_sizes_really_do_collide_on_the_label(self):
+        """先確認這個測試在測真的東西：同名、但比例差超過容許範圍。"""
+        self.assertEqual(pf.label_for(*self.HAND), pf.label_for(*self.CLASH))
+        delta = pf.relative_delta(self.CLASH[0] / self.CLASH[1],
+                                  self.HAND[0] / self.HAND[1])
+        self.assertGreater(delta, 0.02)
+        self.assertLess(delta, pf.LABEL_TOLERANCE)
+
+    def test_hand_calibration_survives_a_same_label_derive(self):
+        cfg = self._cfg()
+        pf.select_for_window(cfg, *self.CLASH)
+        survivors = [p for p in pf.get_profiles(cfg)
+                     if (p["client_width"], p["client_height"]) == self.HAND]
+        self.assertEqual(len(survivors), 1, "手工校準的那一組被換掉了")
+        self.assertTrue(pf.is_hand_calibrated(survivors[0]))
+        self.assertEqual(survivors[0]["regions"]["table_marker"],
+                         {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4})
+
+    def test_the_derived_profile_gets_a_size_qualified_label(self):
+        cfg = self._cfg()
+        selection = pf.select_for_window(cfg, *self.CLASH)
+        self.assertEqual(selection["label"], f"21:9 ({self.CLASH[0]}x{self.CLASH[1]})")
+        self.assertEqual(cfg["active_profile"], selection["label"])
+
+    def test_labels_stay_unique(self):
+        """清單裡出現兩個同名項目，下拉選單就永遠只挑得到第一個。"""
+        cfg = self._cfg()
+        pf.select_for_window(cfg, *self.CLASH)
+        pf.select_for_window(cfg, *self.HAND)
+        pf.select_for_window(cfg, *self.CLASH)
+        labels = [p["label"] for p in pf.get_profiles(cfg)]
+        self.assertEqual(len(labels), len(set(labels)), labels)
+
+    def test_a_derived_profile_may_still_be_replaced(self):
+        """換算來的隨時能再算一次，不需要為它保留名字。"""
+        cfg = self._cfg()
+        pf.select_for_window(cfg, *self.CLASH)
+        before = len(pf.get_profiles(cfg))
+        pf.select_for_window(cfg, self.CLASH[0], self.CLASH[1])
+        self.assertEqual(len(pf.get_profiles(cfg)), before)
+
+    def test_save_as_does_not_create_a_duplicate_label(self):
+        cfg = self._cfg()
+        cfg["calibration"] = {"client_width": self.CLASH[0], "client_height": self.CLASH[1]}
+        created = pf.save_as(cfg, *self.CLASH)
+        labels = [p["label"] for p in pf.get_profiles(cfg)]
+        self.assertEqual(len(labels), len(set(labels)), labels)
+        self.assertEqual(created["label"], f"21:9 ({self.CLASH[0]}x{self.CLASH[1]})")
+        self.assertTrue(any((p["client_width"], p["client_height"]) == self.HAND
+                            for p in pf.get_profiles(cfg)))
+
+    def test_save_as_still_overwrites_the_same_aspect(self):
+        """同一種比例（誤差在容許範圍內）按「另存」仍然是覆蓋，不是一直新增。"""
+        cfg = self._cfg()
+        before = len(pf.get_profiles(cfg))
+        pf.save_as(cfg, 3440, 1440)          # 跟 1937x817 差 0.76%，算同一種
+        self.assertEqual(len(pf.get_profiles(cfg)), before)
+        self.assertEqual(pf.find_by_label(cfg, "21:9")["client_width"], 3440)
+
+
+class TestIsHandCalibrated(unittest.TestCase):
+    def test_plain_profile_counts_as_hand_calibrated(self):
+        self.assertTrue(pf.is_hand_calibrated(pf._make_profile("21:9", 1937, 817, {}, {})))
+
+    def test_seeded_and_derived_do_not(self):
+        seeded = pf._make_profile("16:9", 1600, 900, {}, {}, seeded_from="21:9")
+        self.assertFalse(pf.is_hand_calibrated(seeded))
+        derived = pf._make_profile("4:3", 1200, 900, {}, {})
+        derived["derived_from"] = "21:9"
+        self.assertFalse(pf.is_hand_calibrated(derived))
+
+
 if __name__ == "__main__":
     unittest.main()

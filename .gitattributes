@@ -12,6 +12,8 @@
 
 # 二進位檔不要做任何轉換
 *.png binary
+*.jpg binary
+*.jpeg binary
 *.ico binary
 *.zip binary
 *.exe binary

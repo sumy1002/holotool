@@ -9,6 +9,8 @@ import tkinter as tk
 from dataclasses import dataclass
 from typing import Optional
 
+from .geometry import PANEL_MARGIN, choose_panel_corner
+
 
 @dataclass
 class SelectionResult:
@@ -27,6 +29,15 @@ class SelectionResult:
         return self.status == "ok"
 
 
+GUIDE_REGION_COLOR = "#ffe840"
+GUIDE_POINT_COLOR = "#60e0ff"
+EXAMPLE_MARGIN = PANEL_MARGIN
+# 範例圖佔螢幕寬度的比例。太大會擋住畫面，太小看不出框在哪。
+EXAMPLE_WIDTH_FRAC = 0.26
+# 整層遮罩是 alpha 0.35，範例圖照原亮度畫上去會暗到看不清楚，先提亮再畫。
+EXAMPLE_BRIGHTEN = 1.9
+
+
 class ScreenSelector:
     """回傳的座標一律為「螢幕絕對座標」。
 
@@ -35,13 +46,32 @@ class ScreenSelector:
     重要：如果程式已經有一個 tkinter 主視窗（例如 gui.py），一定要把它當成 master
     傳進來，這樣才會用 Toplevel 掛在同一個 Tcl 解譯器底下。否則會產生第二個 Tk
     根視窗，關閉遮罩後主視窗會失去回應。
+
+    ## 圖示提示（example / guide）
+
+    光靠文字說明「框選左上角 High & Low 標題」，使用者無法知道要不要含外框、
+    框大一點是不是比較保險 —— 猜錯的結果是辨識分數莫名偏低，而且看不出原因。
+    所以這裡可以帶兩種視覺提示進來：
+
+    * `example`：一張 PIL 圖，畫在螢幕角落（半透明），內容是「這一項在範例畫面上
+      該框到哪」。由 `src/calibguide.py` 產生。
+    * `guide`：`{"kind": "region"|"point", "rect": (x, y, w, h)}`，螢幕絕對座標，
+      直接在遊戲畫面上把建議的框／十字畫出來，使用者照著描或自行調整都行。
+
+    兩者都是 optional，沒帶就退回原本的純文字遮罩。
     """
 
-    def __init__(self, instruction: str, mode: str = "region", master: Optional[tk.Misc] = None):
+    def __init__(self, instruction: str, mode: str = "region", master: Optional[tk.Misc] = None,
+                 example=None, example_caption: str = "",
+                 guide: Optional[dict] = None, window_rect: Optional[tuple] = None):
         self.mode = mode
         self.status = "skip"
         self.value: Optional[dict] = None
         self.start: Optional[tuple[int, int]] = None
+        self._guide = guide
+        self._guide_ids: list[int] = []
+        self._example_ids: list[int] = []
+        self._example_imgtk = None
 
         self._owns_root = master is None
         self.root = tk.Tk() if self._owns_root else tk.Toplevel(master)
@@ -55,20 +85,48 @@ class ScreenSelector:
         self.canvas = tk.Canvas(self.root, bg="black", highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
 
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+
+        if window_rect:
+            self._draw_window_outline(window_rect)
+        if guide:
+            self._draw_guide(guide)
+
         hint = "拖曳滑鼠框選一個區域" if mode == "region" else "點擊滑鼠左鍵選取一個座標點"
-        self.canvas.create_text(
-            self.root.winfo_screenwidth() // 2,
-            70,
+        guide_hint = ""
+        if guide:
+            guide_hint = ("畫面上的虛線框就是建議範圍，照著描即可（覺得不準可自行調整）\n"
+                          if guide.get("kind") == "region" else
+                          "畫面上的虛線十字就是建議位置，照著點即可（覺得不準可自行調整）\n")
+
+        # 說明文字要放上面還是下面，看這一項在哪。
+        # 這幾行字又大又白，壓在建議框上面的話，最需要看清楚的地方剛好被蓋住 ——
+        # 牌桌標記、過關標題、五格手牌都在畫面上半部，貼底的按鈕都在下半部。
+        # 沒有建議框時（None）維持放上面，跟舊版一樣。
+        text_y = (screen_h - 150) if self._guide_in_top_half(guide, screen_h) else 70
+        header = self.canvas.create_text(
+            screen_w // 2,
+            text_y,
             text=(
                 f"{instruction}\n\n"
                 f"{hint}\n"
+                f"{guide_hint}"
                 "這層半透明畫面就是校準工具，HoloTool 主視窗不會關閉，選完會自動回來\n"
-                "Esc = 跳過這一項　　Q 或滑鼠右鍵 = 結束校準"
+                "Esc = 跳過這一項　　Q 或滑鼠右鍵 = 結束校準　　H = 隱藏／顯示範例圖"
             ),
             fill="white",
             font=("Microsoft JhengHei", 18, "bold"),
             justify="center",
+            # 限制寬度讓它自己換行，否則長句會一路延伸到範例圖底下互相打到
+            width=int(screen_w * 0.62),
         )
+
+        if example is not None:
+            obstacles = [r for r in (self._guide_screen_rect(guide),
+                                     self.canvas.bbox(header)) if r]
+            self._draw_example(example, example_caption, screen_w, screen_h, obstacles)
+
         self.rect_id = None
 
         self.canvas.bind("<ButtonPress-1>", self._on_press)
@@ -78,10 +136,107 @@ class ScreenSelector:
         self.root.bind("<Escape>", self._on_escape)
         self.root.bind("<KeyPress-q>", self._on_abort)
         self.root.bind("<KeyPress-Q>", self._on_abort)
+        self.root.bind("<KeyPress-h>", self._toggle_example)
+        self.root.bind("<KeyPress-H>", self._toggle_example)
         self.root.focus_force()
 
     def _to_canvas(self, screen_x: int, screen_y: int) -> tuple[int, int]:
         return screen_x - self.root.winfo_rootx(), screen_y - self.root.winfo_rooty()
+
+    # ------------------------------------------------------------ 提示圖層
+
+    def _guide_screen_rect(self, guide: Optional[dict]) -> Optional[tuple]:
+        """建議框在 canvas 座標的 (x0, y0, x1, y1)。沒有建議框回 None。"""
+        if not guide or not guide.get("rect"):
+            return None
+        left, top, width, height = guide["rect"]
+        x0, y0 = self._to_canvas(int(left), int(top))
+        return x0, y0, x0 + int(width), y0 + int(height)
+
+    def _guide_in_top_half(self, guide: Optional[dict], screen_h: int) -> bool:
+        rect = self._guide_screen_rect(guide)
+        if rect is None:
+            return False
+        return (rect[1] + rect[3]) / 2 < screen_h / 2
+
+    def _draw_window_outline(self, rect: tuple) -> None:
+        """把遊戲視窗的用戶端範圍用細虛線圈出來，避免框到視窗外面。"""
+        left, top, width, height = rect
+        x0, y0 = self._to_canvas(int(left), int(top))
+        self.canvas.create_rectangle(x0, y0, x0 + int(width), y0 + int(height),
+                                     outline="#8888aa", width=1, dash=(2, 6))
+
+    def _draw_guide(self, guide: dict) -> None:
+        rect = guide.get("rect")
+        if not rect:
+            return
+        left, top, width, height = rect
+        x0, y0 = self._to_canvas(int(left), int(top))
+        x1, y1 = x0 + int(width), y0 + int(height)
+        if guide.get("kind") == "region":
+            color = GUIDE_REGION_COLOR
+            self._guide_ids.append(self.canvas.create_rectangle(
+                x0, y0, x1, y1, outline=color, width=2, dash=(7, 5)))
+            # 四個角落畫實線 L 角標：虛線在複雜背景上容易看不見，角標一定看得到
+            arm = max(8, min(x1 - x0, y1 - y0) // 5)
+            for cx, sx in ((x0, 1), (x1, -1)):
+                for cy, sy in ((y0, 1), (y1, -1)):
+                    self._guide_ids.append(self.canvas.create_line(
+                        cx, cy, cx + sx * arm, cy, fill=color, width=3))
+                    self._guide_ids.append(self.canvas.create_line(
+                        cx, cy, cx, cy + sy * arm, fill=color, width=3))
+            label_y = y0 - 14 if y0 > 30 else y1 + 14
+            self._guide_ids.append(self.canvas.create_text(
+                x0, label_y, text="建議範圍", anchor="w", fill=color,
+                font=("Microsoft JhengHei", 12, "bold")))
+        else:
+            color = GUIDE_POINT_COLOR
+            cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
+            r = max(10, (x1 - x0) // 2)
+            self._guide_ids.append(self.canvas.create_oval(
+                cx - r, cy - r, cx + r, cy + r, outline=color, width=2, dash=(6, 4)))
+            self._guide_ids.append(self.canvas.create_line(
+                cx - r * 2, cy, cx + r * 2, cy, fill=color, width=2))
+            self._guide_ids.append(self.canvas.create_line(
+                cx, cy - r * 2, cx, cy + r * 2, fill=color, width=2))
+            self._guide_ids.append(self.canvas.create_text(
+                cx + r * 2 + 6, cy, text="建議位置", anchor="w", fill=color,
+                font=("Microsoft JhengHei", 12, "bold")))
+
+    def _draw_example(self, example, caption: str, screen_w: int, screen_h: int,
+                      obstacles: list) -> None:
+        try:
+            from PIL import ImageEnhance, ImageTk
+        except ImportError:
+            return
+        target_w = max(240, int(screen_w * EXAMPLE_WIDTH_FRAC))
+        img = example
+        if img.width != target_w:
+            img = img.resize((target_w, max(1, round(img.height * target_w / img.width))))
+        img = ImageEnhance.Brightness(img).enhance(EXAMPLE_BRIGHTEN)
+        self._example_imgtk = ImageTk.PhotoImage(img)
+
+        pad = 10
+        caption_h = 30
+        panel_w = img.width + pad * 2
+        panel_h = img.height + pad * 2 + caption_h
+        x, y = choose_panel_corner(panel_w, panel_h, screen_w, screen_h, obstacles)
+
+        self._example_ids.append(self.canvas.create_rectangle(
+            x, y, x + panel_w, y + panel_h, fill="#f0f0f0", outline="#ffffff", width=2))
+        self._example_ids.append(self.canvas.create_text(
+            x + pad, y + pad + caption_h // 2 - 4, anchor="w",
+            text=caption or "範例", fill="#101010",
+            font=("Microsoft JhengHei", 12, "bold")))
+        self._example_ids.append(self.canvas.create_image(
+            x + pad, y + pad + caption_h, anchor="nw", image=self._example_imgtk))
+
+    def _toggle_example(self, _event=None):
+        if not self._example_ids:
+            return
+        hidden = self.canvas.itemcget(self._example_ids[0], "state") == "hidden"
+        for item in self._example_ids:
+            self.canvas.itemconfigure(item, state="normal" if hidden else "hidden")
 
     def _on_press(self, event):
         self.start = (event.x_root, event.y_root)
@@ -142,12 +297,12 @@ class ScreenSelector:
         return SelectionResult(self.status, self.value)
 
 
-def select_region(instruction: str, master: Optional[tk.Misc] = None) -> SelectionResult:
-    return ScreenSelector(instruction, "region", master).run()
+def select_region(instruction: str, master: Optional[tk.Misc] = None, **hints) -> SelectionResult:
+    return ScreenSelector(instruction, "region", master, **hints).run()
 
 
-def select_point(instruction: str, master: Optional[tk.Misc] = None) -> SelectionResult:
-    return ScreenSelector(instruction, "point", master).run()
+def select_point(instruction: str, master: Optional[tk.Misc] = None, **hints) -> SelectionResult:
+    return ScreenSelector(instruction, "point", master, **hints).run()
 
 
 def _hex_rgb(color: str) -> tuple[int, int, int]:

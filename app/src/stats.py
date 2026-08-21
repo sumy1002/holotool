@@ -58,8 +58,13 @@ class DailyStats:
             base.update(loaded)
             for label in ALL_LABELS:
                 base["card_counts"].setdefault(label, 0)
+            base["date"] = self.day
             return base
-        return _empty_stats()
+        # 補算功能會為過去的日期開檔（見 src/reconcile.py），所以 date 一定要
+        # 跟著 self.day —— 寫成「今天」的話檔名與內容會互相矛盾。
+        fresh = _empty_stats()
+        fresh["date"] = self.day
+        return fresh
 
     def save(self) -> None:
         with open(self.path, "w", encoding="utf-8") as f:
