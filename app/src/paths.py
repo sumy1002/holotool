@@ -124,9 +124,21 @@ def install_default_ui_templates(overwrite: bool = True) -> list[str]:
 
 
 def prepare_runtime() -> str:
-    """切換工作目錄到資料根目錄，並建立必要資料夾。啟動 GUI / exe 時呼叫。"""
+    """切換工作目錄到資料根目錄，並建立必要資料夾。啟動 GUI / exe 時呼叫。
+
+    順便補齊**缺少的**內建樣板（`overwrite=False`，永遠不會蓋掉使用者自己抓的）。
+
+    畫面標記那一行是 2026-08-21 補的，而且是必要的：card_templates 是使用者
+    資料夾，既不進版控、也不放進更新包（`PROTECTED_DIRS`）。所以新增一張內建
+    標記圖（例如 `ui_max_win.png`）時，它只會跟著 defaults/ui 送到使用者
+    手上 —— 如果沒有人把它複製過去，card_templates 裡就永遠沒有那張圖，
+    程式也就永遠讀不到（那正是「上限=無」的成因）。
+    以前只有按「套用截圖預設框選」才會複製，而那顆按鈕會**覆蓋**六張標記，
+    自己重新框選過的人根本不敢按。
+    """
     root = project_root()
     os.chdir(root)
     ensure_runtime_dirs()
     install_default_parts(overwrite=False)
+    install_default_ui_templates(overwrite=False)
     return root

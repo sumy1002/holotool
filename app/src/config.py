@@ -41,7 +41,14 @@ CONFIG_PATH = config_path()
 #   6 = 內建畫面標記樣板換成 1365x576 原生解析度（原本是 1024 縮圖再放大），
 #       draw_prompt 與 fail_marker 的門檻跟著重新量過。還在用內建樣板的人，
 #       `templates.capture_client_width` 也會一起同步（自己抓過樣板的人不動）。
-CONFIG_VERSION = 6
+#   7 = 終於拿到「已達最高獲得金額」畫面的原生截圖，`ui_max_win.png` 變成
+#       內建樣板（以前這一張沒有，所以那個畫面永遠是「上限=無」，
+#       負責按下去的 _handle_max_win() 一次都沒執行過）。
+#       門檻跟著重新量：0.78 → 0.71。
+#   8 = 比大小改成「衝 12800 上限」：不再中途兌現
+#       （`highlow_min_win_prob_to_continue` 0.5 → 0）、
+#       也不再設連勝上限（`highlow_max_chain` 6 → 0）。
+CONFIG_VERSION = 8
 
 # 升級到某個版本時，這些欄位要強制吃新的預設值。
 # 舊設定檔裡存著舊的調校數字，_deep_merge 會讓「使用者的舊值」蓋掉新預設，
@@ -54,6 +61,13 @@ RETUNED_ON_UPGRADE = {
     #     兩個標記的門檻跟著重新量過。舊設定檔裡的 0.78 / 0.82 會讓
     #     draw_prompt 與 fail_marker 永遠過不了門檻。
     6: ("marker_thresholds",),
+    # 7 = 新增 max_win_marker 的內建樣板，門檻重新量過（0.78 → 0.71）。
+    #     這一項一定要強制覆蓋：舊設定檔裡的 0.78 會把「金額還在跳動、按鈕
+    #     還沒出現」那張過場影格（0.810）擦邊擋掉。
+    7: ("marker_thresholds",),
+    # 8 = 比大小的收手策略改成「衝上限」。舊設定檔裡的 0.5 / 6 會讓 bot
+    #     在半路兌現、或在還沒到 12800 時就強制收手，與這個工具的目標矛盾。
+    8: ("highlow_min_win_prob_to_continue", "highlow_max_chain"),
 }
 
 DEFAULT_CONFIG = {
@@ -104,7 +118,7 @@ DEFAULT_CONFIG = {
         "challenge_marker": 0.80,
         "fail_marker": 0.79,
         "poker_fail_marker": 0.74,
-        "max_win_marker": 0.78,
+        "max_win_marker": 0.71,
     },
 
     # 各標記往外擴張搜尋的量 [左右, 上下]，單位是「該區域自身的寬/高比例」。
@@ -134,11 +148,21 @@ DEFAULT_CONFIG = {
     # 選牌策略計算時的蒙地卡羅模擬次數，越大越準但越慢
     "monte_carlo_samples": 3000,
 
-    # 比大小：只有在「猜中機率」大於此門檻時才繼續加倍，否則收手兌現
-    "highlow_min_win_prob_to_continue": 0.5,
+    # 比大小：勝率低於這個門檻就收手兌現。**預設 0 = 永遠不收手。**
+    #
+    # 這個工具的目標是「衝到 12800 上限、每天兩次」，那是全有全無的目標：
+    # 中途兌現拿走 400 枚，這一輪就永遠到不了 12800。舊的預設 0.5 是在
+    # 最大化「期望硬幣數」，跟這個目標互相矛盾 —— 實機 log 出現過
+    # 「目前牌=8H 預估勝率=47.1% → 取消兌現」，連 400 都不到就收手了。
+    # 想改回「賺硬幣」的玩法，把它調回 0.5。
+    "highlow_min_win_prob_to_continue": 0.0,
 
-    # 比大小：最多連續加倍幾次就強制收手（保險用，避免無限追加風險）
-    "highlow_max_chain": 6,
+    # 比大小：連續加倍幾次就強制收手。**預設 0 = 不設上限。**
+    #
+    # 遊戲自己會在 12800 喊停（那正是我們要的），所以這裡再設一個上限只會
+    # 提前把自己攔下來。而且需要幾次是看牌型的底金：底金 400 要 5 次、
+    # 底金 100 要 7 次 —— 舊的預設 6 在後者會直接讓上限變成永遠達不到。
+    "highlow_max_chain": 0,
 
     # 每一輪最多允許換牌幾次（目前遊戲規則若為單次換牌請設1）
     "max_redraw_rounds": 1,
@@ -254,7 +278,18 @@ def load_config() -> dict:
     merged = _deep_merge(json.loads(json.dumps(DEFAULT_CONFIG)), cfg)
 
     retuned = _apply_retuning(merged, old_version)
-    resized = _sync_bundled_marker_size(merged) if old_version < 6 else False
+    # **每次載入都檢查**，不是只在升級時。
+    #
+    # 原本寫 `if old_version < 6`，於是這個順序就出事了（2026-08-21 實機）：
+    # 設定檔升到 6 → 之後才把內建標記圖複製進 card_templates\ →
+    # `capture_client_width` 永遠停在 1024，而圖是 1365 來源的，
+    # 所有標記都用錯 33% 的倍率在比對（實測「過關」0.69 對門檻 0.80，
+    # 湊到牌的畫面就這樣卡住）。
+    #
+    # 這個函式本身是保守的：**七張標記全部都是內建原封複本**時才會動，
+    # 只要有一張是使用者自己抓的就整組不碰。所以無條件跑沒有風險，
+    # 而且順序再怎麼顛倒都能自己收斂。
+    resized = _sync_bundled_marker_size(merged)
 
     # 把舊設定檔的頂層 regions/points 搬進 profile。座標值一個都不改。
     migrated = profiles_mod.ensure_profiles(merged)
@@ -292,6 +327,28 @@ def _marker_image_paths(cfg: dict) -> dict:
         if fname in UI_MARKER_FILES.values():
             out[fname] = resolve_data_path(rel)
     return out
+
+
+def marker_source_mix(cfg: dict) -> tuple[list[str], list[str]]:
+    """把畫面標記分成「還是內建原封複本」與「使用者自己抓的」兩堆。
+
+    為什麼要知道這件事：`capture_client_width/height` 是**一個全域值**，
+    代表「這些標記圖是在多大的畫面下截的」。兩堆混在一起時，那一個數字
+    不可能同時對兩邊都正確 —— 只有一邊會被縮放到對的倍率。
+
+    目前只有 `ui_max_win.png` 天生會落在「內建」那一堆（那個畫面一天只出現
+    兩次，幾乎沒有人會自己去校準它），所以一旦使用者重新框選了其他六張，
+    上限標記就會用錯倍率。差距不大時 `marker_score` 的倍率階梯（0.68~1.15）
+    還吃得下，差很多（例如大尺寸 16:9 視窗）就會失效。
+    """
+    bundled_dir = default_ui_dir()
+    bundled: list[str] = []
+    own: list[str] = []
+    for name, path in _marker_image_paths(cfg).items():
+        if not os.path.exists(path):
+            continue
+        (bundled if _same_bytes(path, os.path.join(bundled_dir, name)) else own).append(name)
+    return sorted(bundled), sorted(own)
 
 
 def _same_bytes(a: str, b: str) -> bool:

@@ -20,7 +20,7 @@ from .cardparts import (
     missing_parts,
     unusable_parts,
 )
-from .defaults_layout import BUNDLED_MARKER_WIDTH
+from .defaults_layout import BUNDLED_MARKER_HEIGHT, BUNDLED_MARKER_WIDTH
 from .recognize import (
     CardReader,
     load_card_templates,
@@ -152,6 +152,38 @@ class Bot:
                     f"{' '.join(borrowed)} —— 在「點數/花色樣板」分頁抓一次自己的就會自動改用你的。"
                 )
 
+    def _report_marker_scale(self) -> None:
+        """畫面標記的縮放基準對不對？對不上的話所有標記分數會整排偏低。
+
+        `capture_client_width/height` 是**一個全域值**（「這些圖是在多大的畫面下
+        截的」）。內建圖與使用者自己抓的圖混在一起時，那個數字只能對其中一邊。
+
+        2026-08-21 實機就是這樣卡住的：七張標記全是內建的（1365x576 來源），
+        設定檔卻還寫著 1024x438 —— 倍率差 33%，「過關」只拿到 0.69（門檻 0.80），
+        湊到牌的畫面就停在那裡不動。
+        """
+        try:
+            from .config import marker_source_mix
+            bundled, own = marker_source_mix(self.cfg)
+        except Exception:
+            return
+        tmpl = self.cfg.get("templates", {}) or {}
+        cap_w = tmpl.get("capture_client_width")
+        cap_h = tmpl.get("capture_client_height")
+        if bundled and own:
+            log(
+                f"[樣板] 畫面標記混著兩種來源：內建 {len(bundled)} 張"
+                f"（{'、'.join(bundled)}）、你自己抓的 {len(own)} 張。"
+                f"縮放基準只有一個（目前 {cap_w}x{cap_h}），只能對其中一邊 —— "
+                "內建那幾張的分數可能偏低。到「校準」分頁把它們也重新框選一次最乾淨。"
+            )
+        elif bundled and (cap_w, cap_h) != (BUNDLED_MARKER_WIDTH, BUNDLED_MARKER_HEIGHT):
+            log(
+                f"[警告] 畫面標記全部是內建的（來源 {BUNDLED_MARKER_WIDTH}x"
+                f"{BUNDLED_MARKER_HEIGHT}），設定檔卻寫著 {cap_w}x{cap_h}。"
+                "比對倍率會算錯，所有標記分數都會偏低。"
+            )
+
     def _load_ui_templates(self, config: dict) -> dict:
         mapping = {
             "table_marker": "table_marker_image",
@@ -202,13 +234,16 @@ class Bot:
                 )
             self._report_part_sources()
             self._report_unusable_parts()
+            self._report_marker_scale()
             limit = int(self.cfg.get("daily_max_wins", 2))
             done = self._max_win_count()
             log(f"今日已達最高獲得金額 {done}/{limit} 次"
                 + ("（已用完，一偵測到上限畫面就會停止）" if done >= limit else ""))
             if self.ui_templates.get("max_win") is None:
                 log(
-                    "[提醒] 還沒有「已達最高獲得金額」的標記樣板，無法自動判斷每日上限。"
+                    "[提醒] 找不到「已達最高獲得金額」的標記樣板 (ui_max_win.png)，"
+                    "無法自動判斷每日上限。這一張現在是內建的，"
+                    "重建 exe 或按「套用截圖預設框選」就會回來；真的要自己抓就"
                     "請到「校準」分頁校準『已達最高獲得金額標記』與『上限畫面的「再玩一次」』。"
                 )
 
@@ -797,7 +832,13 @@ class Bot:
             log(f"[翻倍對話] 進行挑戰（目前連勝 {self._highlow_chain}）")
             self._act(state, "challenge_button")
         else:
-            log(f"[翻倍對話] 取消兌現（預估下一手勝率 {self._last_hl_win_prob:.1%}）")
+            why = (f"已連勝 {self._highlow_chain} 次，達到上限設定"
+                   if int(self.cfg.get("highlow_max_chain", 0) or 0)
+                   and self._highlow_chain >= int(self.cfg.get("highlow_max_chain", 0))
+                   else f"預估下一手勝率 {self._last_hl_win_prob:.1%} 低於門檻 "
+                        f"{float(self.cfg.get('highlow_min_win_prob_to_continue', 0.0)):.0%}")
+            log(f"[翻倍對話] 取消兌現（{why}）—— "
+                "這一輪就到不了 12800 了；想一路衝上限請把「比大小續押勝率門檻」設成 0")
             self._act(state, "cashout_button")
             self._highlow_chain = 0
         self._last_highlow_label = None

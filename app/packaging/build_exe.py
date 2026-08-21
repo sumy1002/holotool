@@ -482,6 +482,7 @@ def main() -> None:
                     ui_markers = {
                         "table_marker.png", "ui_draw_prompt.png", "ui_congrats.png",
                         "ui_challenge.png", "ui_fail.png", "ui_poker_fail.png",
+                        "ui_max_win.png",
                     }
                     # defaults\ref\ 是校準用的範例圖，屬於程式資產而不是使用者資料，
                     # 每次打包都要用新的覆蓋 —— 不然改過的範例圖永遠進不到 exe 版。

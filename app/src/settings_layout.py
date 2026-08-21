@@ -52,8 +52,10 @@ TIMING_FIELDS: list[tuple[str, str, str]] = [
 OTHER_FIELDS: list[tuple[str, str, str]] = [
     ("daily_max_wins", "每日上限次數", "達到最高金額幾次之後就收工（遊戲規則是 2 次）"),
     ("monte_carlo_samples", "選牌模擬次數", "越大越準但越慢，建議 1000~5000"),
-    ("highlow_min_win_prob_to_continue", "比大小續押勝率門檻", "預估勝率低於此值就收手兌現"),
-    ("highlow_max_chain", "比大小最多連續加倍次數", "保險上限，避免無限追加"),
+    ("highlow_min_win_prob_to_continue", "比大小續押勝率門檻",
+     "勝率低於此值就收手兌現。0 = 永遠不收手，一路衝 12800（預設）"),
+    ("highlow_max_chain", "比大小最多連續加倍次數",
+     "0 = 不設上限，讓遊戲自己在 12800 喊停（預設）"),
     ("aspect_ratio_tolerance", "長寬比容許誤差", "超過就算成另一種比例，另存一組校準。0.02 = 2%"),
 ]
 
