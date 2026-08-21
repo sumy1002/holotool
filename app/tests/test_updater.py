@@ -572,6 +572,66 @@ class TestRootWritableCheck(unittest.TestCase):
                         body.index("download_release"))
 
 
+class TestLastUpdateOutcome(unittest.TestCase):
+    """置換是在程式關掉之後做的，所以只能「下次啟動時回頭看 log」。
+
+    使用者兩次遇到「按了更新、跑完之後版本沒變」，兩次都只能靠人工去翻
+    `app\\logs\\update.log`。那個檔案在安裝目錄深處，沒有人會主動去看 ——
+    所以啟動時要把結論搬到眼前。
+    """
+
+    def _with_log(self, text: str):
+        tmp = tempfile.mkdtemp()
+        logs = os.path.join(tmp, "logs")
+        os.makedirs(logs)
+        with open(os.path.join(logs, "update.log"), "w", encoding="utf-8") as f:
+            f.write(text)
+        saved = updater.log_dir
+        updater.log_dir = lambda: logs
+        try:
+            return updater.last_update_outcome()
+        finally:
+            updater.log_dir = saved
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_no_log_at_all(self):
+        self.assertEqual(self._with_log("")[0], "none")
+
+    def test_a_successful_run(self):
+        status, _ = self._with_log(
+            "==== HoloTool update 1 ====\n[OK] program files replaced\n==== done ====\n")
+        self.assertEqual(status, "ok")
+
+    def test_a_failed_copy(self):
+        status, detail = self._with_log(
+            "==== HoloTool update 1 ====\n"
+            "[ERROR] robocopy exit code 16 - update incomplete\n==== done ====\n")
+        self.assertEqual(status, "failed")
+        self.assertIn("16", detail)
+
+    def test_a_script_that_vanished(self):
+        """`D:\\HoloTool` 那台的樣子：只有標頭，連 `==== done ====` 都沒有。"""
+        status, _ = self._with_log(
+            "==== HoloTool update 1 ====\nroot=D:\\HoloTool\nstage=C:\\Temp\n")
+        self.assertEqual(status, "unfinished")
+
+    def test_only_the_latest_run_counts(self):
+        """更新過很多次時，前面那些成功/失敗都不算數。"""
+        status, _ = self._with_log(
+            "==== HoloTool update 1 ====\n[OK] program files replaced\n==== done ====\n"
+            "==== HoloTool update 2 ====\n[ERROR] robocopy exit code 8\n==== done ====\n")
+        self.assertEqual(status, "failed")
+
+    def test_success_after_a_warning_still_counts_as_ok(self):
+        """taskkill 那條 [WARN] 之後照樣複製成功 —— 那是成功，不是失敗。"""
+        status, _ = self._with_log(
+            "==== HoloTool update 1 ====\n"
+            "[WARN] pid 123 alive after 15s - forcing it to close\n"
+            "[OK] program files replaced\n==== done ====\n")
+        self.assertEqual(status, "ok")
+
+
 class TestHardExit(unittest.TestCase):
     def test_hard_exit_really_ends_the_process(self):
         """destroy() 之後行程沒死透，更新就會卡住。這裡用子行程驗證它真的會結束。"""

@@ -2428,6 +2428,34 @@ class HoloToolGUI(tk.Tk):
         self.destroy()
 
 
+def _report_last_update() -> None:
+    """啟動時回頭看一眼「上一次更新成功了沒」。
+
+    置換是在程式**關掉之後**由一支批次檔做的，所以程式當下沒有任何機會知道
+    結果 —— 使用者只會看到「跑完了，但版本沒變」，然後完全不知道要看哪裡。
+    這幾行就是把 app/logs/update.log 的結論搬到眼前來。
+    """
+    try:
+        status, detail = updater.last_update_outcome()
+    except Exception:
+        return
+    if status == "none":
+        return
+    if status == "ok":
+        logger.log(f"[更新] 上一次更新已完成（{detail}）")
+        return
+    where = os.path.join(updater.log_dir(), "update.log")
+    if status == "unfinished":
+        logger.log(
+            f"[更新] ⚠ 上一次更新**沒有跑完** —— 置換腳本中途就消失了，"
+            f"所以版本沒有變。安裝目錄沒有被動到，校準與樣板都在。詳見 {where}"
+        )
+    else:
+        logger.log(f"[更新] ⚠ 上一次更新沒有成功：{detail}")
+        logger.log(f"        完整紀錄在 {where}；"
+                   "校準與樣板不會被動到，可以直接再試一次或到 Release 頁面手動下載。")
+
+
 def main() -> None:
     prepare_runtime()
     if getattr(sys, "frozen", False):
@@ -2443,6 +2471,7 @@ def main() -> None:
         sys.excepthook = _gui_excepthook
     app = HoloToolGUI()
     logger.log(f"HoloTool v{APP_VERSION} GUI 已啟動")
+    _report_last_update()
     app.mainloop()
 
 

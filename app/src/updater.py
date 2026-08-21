@@ -823,6 +823,43 @@ def launch_apply_script(script: str) -> None:
     )
 
 
+def last_update_outcome() -> tuple[str, str]:
+    """上一次更新到底成功了沒？回傳 `(狀態, 說明)`。
+
+    狀態是 `"ok"` / `"failed"` / `"unfinished"` / `"none"`。
+
+    ## 為什麼需要這個
+
+    使用者實際遇到過兩次「按了更新、跑完之後版本沒變」，兩次都只能靠人工去
+    翻 `update.log` 才知道發生什麼事 —— 而那個檔案在安裝目錄深處，
+    沒有人會主動去看。置換腳本是在主程式**關掉之後**才動手的，所以程式自己
+    沒有任何機會知道結果；唯一的辦法就是**下次啟動時回頭看那份 log**。
+
+    只看最後一次執行的那一段（從最後一個 `==== HoloTool update` 開始）。
+    """
+    path = os.path.join(log_dir(), "update.log")
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return "none", ""
+    marker = "==== HoloTool update"
+    index = text.rfind(marker)
+    if index < 0:
+        return "none", ""
+    block = text[index:].strip()
+    lines = [l.strip() for l in block.splitlines() if l.strip()]
+    if any(l.startswith("[OK]") for l in lines):
+        return "ok", lines[0]
+    problems = [l for l in lines if l.startswith("[ERROR]") or l.startswith("[WARN]")]
+    if problems:
+        return "failed", problems[-1]
+    # 連 `==== done ====` 都沒有 = 腳本中途整個消失（例如被 job 連坐殺掉）
+    if not any(l.startswith("==== done") for l in lines):
+        return "unfinished", lines[0]
+    return "failed", lines[-1]
+
+
 def hard_exit(code: int = 0) -> None:
     """**保證**行程結束。呼叫之後不會回來。
 
