@@ -152,6 +152,26 @@ class TestSavesAccumulate(PartsDirTestCase):
         self.assertIsNone(self.save_own("suit", "S"), "超過上限應該回 None")
         self.assertEqual(len(self.own_files("suit", "S")), cp.MAX_OWN_PER_LABEL)
 
+    def test_gui_does_not_override_the_cap(self):
+        """上限只能有一份，在 cardparts.MAX_OWN_PER_LABEL。
+
+        2026-08-22 檢視時發現：cardparts 這邊早就因為「rank_5 存滿 8 張、
+        再抓也存不進去」把上限從 8 放寬到 16，但 gui.py 的 `_write_part`
+        還自己傳了一個寫死的 8 進來 —— 使用者實際走的那條路上限根本沒變，
+        那次修正等於從來沒有生效。這條測試直接看 gui.py 的原始碼，
+        擋住「同一個數字存在兩個地方」這種靜默還原。
+        """
+        gui_path = os.path.join(os.path.dirname(ROOT), "gui.py")
+        if not os.path.exists(gui_path):
+            self.skipTest("找不到 gui.py")
+        with open(gui_path, encoding="utf-8") as f:
+            source = f.read()
+        self.assertNotIn("_MAX_PER_LABEL", source,
+                         "gui.py 又出現自己的樣板上限了 —— 上限只能住在 "
+                         "cardparts.MAX_OWN_PER_LABEL")
+        self.assertIn("next_part_path(PARTS_DIR, default_parts_dir(), kind, key)",
+                      source, "gui 應該用 next_part_path 的預設上限")
+
 
 class TestBundledIdentityIsContent(PartsDirTestCase):
     def test_own_file_sitting_on_a_bundled_filename_is_not_bundled(self):

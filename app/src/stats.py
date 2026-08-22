@@ -29,6 +29,13 @@ def _stats_path(day: str) -> str:
     return os.path.join(DATA_DIR, f"stats_{day}.json")
 
 
+def today_stats_path() -> str:
+    """今天統計檔的路徑。GUI 用它的 mtime 判斷「有沒有必要重讀」——
+    以前每 0.5 秒無條件開檔＋解析一次 JSON（含最多 500 筆事件），
+    整個 GUI 開著就一直在做這件事。"""
+    return _stats_path(_today_str())
+
+
 def _empty_stats() -> dict:
     return {
         "date": _today_str(),

@@ -106,9 +106,9 @@ from src.paths import (
     resolve_data_path,
     template_dir,
 )
-from src.recognize import CardReader, load_part_templates, part_sources
+from src.recognize import CardReader, load_part_templates, part_sources, resolve_part_source
 from src.state_machine import detect_frame
-from src.stats import DailyStats
+from src.stats import DailyStats, today_stats_path as stats_today_path
 from src import updater
 from src.version import __version__ as APP_VERSION
 
@@ -1517,40 +1517,11 @@ class HoloToolGUI(tk.Tk):
         except Exception as e:  # noqa: BLE001
             logger.log(f"[錯誤] 儲存 {fname} 失敗：{e!r}")
 
-    def _save_ui_markers(self) -> None:
-        """把用來判斷畫面狀態的區域存成樣板圖。"""
-        mapping = [
-            ("table_marker", "table_marker.png"),
-            ("draw_prompt", "ui_draw_prompt.png"),
-            ("congrats_marker", "ui_congrats.png"),
-            ("challenge_marker", "ui_challenge.png"),
-            ("fail_marker", "ui_fail.png"),
-            ("poker_fail_marker", "ui_poker_fail.png"),
-        ]
-        capture = GameCapture(self.cfg["window_title_substring"])
-        if not capture.locate():
-            return
-        os.makedirs(TEMPLATE_DIR, exist_ok=True)
-        saved = False
-        for region_key, fname in mapping:
-            region = self.cfg["regions"].get(region_key, {})
-            if region.get("w", 0) <= 0:
-                continue
-            try:
-                roi = capture.grab_region(region)
-                cv2.imwrite(os.path.join(TEMPLATE_DIR, fname), roi)
-                saved = True
-                logger.log(f"已更新畫面標記樣板 {fname}")
-            except Exception as e:  # noqa: BLE001
-                logger.log(f"[錯誤] 儲存 {fname} 失敗：{e!r}")
-        if saved:
-            try:
-                cw, ch = capture.get_client_size()
-                set_template_capture_size(self.cfg, cw, ch)
-                save_config(self.cfg)
-                logger.log(f"樣板擷取解析度已記錄為 {cw}x{ch}")
-            except Exception as e:  # noqa: BLE001
-                logger.log(f"[錯誤] 記錄樣板擷取解析度失敗：{e!r}")
+    # 註：以前這裡有一個 `_save_ui_markers()`（一次存六張標記樣板），
+    # 但沒有任何地方呼叫它，而且它的清單漏了 ui_max_win.png ——
+    # 哪天有人拿它來用，上限標記就會悄悄用舊圖。單張標記在框選當下由
+    # `_save_one_ui_marker()` 存（含解析度記錄），那一條才是活的路，
+    # 死程式碼直接移除，免得又出現「兩份差不多的東西改了一份」的坑。
 
     # ------------------------------------------------------- 點數 / 花色樣板
 
@@ -1611,7 +1582,7 @@ class HoloToolGUI(tk.Tk):
             messagebox.showerror("擷取失敗", f"擷取畫面時發生錯誤：{e!r}")
             return
 
-        templates = load_part_templates()
+        templates = load_part_templates(cfg=self.cfg)
         reader = CardReader(part_templates=templates)
         found = 0
         # 「手牌 1~5」與「比大小」不可能同時出現在畫面上：前者只在選牌畫面、
@@ -1743,22 +1714,20 @@ class HoloToolGUI(tk.Tk):
             messagebox.showinfo("沒有東西可存", "請先按「讀取目前畫面」，並填好代號。")
         self._refresh_template_panel()
 
-    _MAX_PER_LABEL = 8
-
     def _write_part(self, kind: str, key: str, image,
                     written: Optional[list] = None) -> int:
         """存一個點數/花色小樣板。上限**只算你自己抓的**，內建的不佔位子。
 
-        這裡曾經有一個很難發現的 bug：內建樣板每個花色都剛好 8 張
-        （suit_S_1~8、suit_C_1~8…），上限也是 8，於是「已經滿了」——
-        按幾次「全部儲存」都不會有任何花色被存下來，畫面也不會報錯。
-        結果就是花色永遠只能用內建那組糊圖，怎麼調都認不準。
+        上限本身交給 `cardparts.next_part_path()` 的預設值（MAX_OWN_PER_LABEL）。
+        這裡以前自己傳了一個寫死的 8 —— 而 cardparts 那邊早就因為
+        「rank_5 存滿 8 張、再抓也存不進去」把上限放寬到 16，結果 GUI 這條
+        唯一會被使用者走到的路還是卡在 8，等於那次修正從來沒有生效過。
+        同一個數字不要存在兩個地方，留 cardparts 那一份就好。
 
-        現在改成：內建樣板不算在上限裡；而且一旦你為某個標籤存了自己的樣板，
-        那個標籤的內建檔就直接刪掉（反正比對時本來就會被忽略）。
+        `next_part_path` 回傳的 stale 清單目前恆為空（儲存這條路上不再刪任何
+        內建檔 —— 內建樣板在自己的樣板湊滿之前還要當墊背），這裡照樣尊重它。
         """
-        path, stale = next_part_path(PARTS_DIR, default_parts_dir(), kind, key,
-                                     self._MAX_PER_LABEL)
+        path, stale = next_part_path(PARTS_DIR, default_parts_dir(), kind, key)
         if path is None:
             return 0
         for old in stale:
@@ -1861,7 +1830,8 @@ class HoloToolGUI(tk.Tk):
         self._refresh_template_panel()
 
     def _refresh_template_panel(self) -> None:
-        templates = load_part_templates()
+        templates = load_part_templates(cfg=self.cfg)
+        _src, _bundled, part_mode = resolve_part_source(self.cfg)
         miss_rank, miss_suit = missing_parts(templates)
         n_rank = len(templates.get("rank") or {})
         n_suit = len(templates.get("suit") or {})
@@ -1869,11 +1839,21 @@ class HoloToolGUI(tk.Tk):
         n_joker = joker_template_count(templates)
         # 鬼牌另外算：它不在 13 個點數裡，但沒有它的話抽到鬼牌就整個卡住，
         # 所以要單獨顯示，不能被「點數 13/13 ✓」蓋掉。
+        mode_tag = ("" if part_mode == "local"
+                    else "　【來源：內建樣板（隨程式更新）】")
         self.tmpl_progress.config(
             text=f"點數 {n_rank - (1 if n_joker else 0)}/13　花色 {n_suit}/4　"
-                 f"中央大圖案 {n_pip}/4　鬼牌 {'✓' if n_joker else '✗'}（{n_joker} 張）")
+                 f"中央大圖案 {n_pip}/4　鬼牌 {'✓' if n_joker else '✗'}（{n_joker} 張）"
+                 + mode_tag)
 
         lines = []
+        if part_mode != "local":
+            # 其他電腦（zip / 安裝檔裝的）吃的是內建樣板，這個分頁蒐集的
+            # 不會參與比對 —— 不講清楚的話，使用者會以為自己抓的有生效。
+            lines.append("ℹ 這份安裝使用「內建樣板」（開發者隨程式提供，更新程式"
+                         "就會更新樣板）。下面蒐集的檔案會保存，但**不會**被拿來"
+                         "辨識；想改用自己蒐集的，把 config.json 的 "
+                         "card_template_source 設成 \"local\"。")
         if miss_rank:
             lines.append("還缺點數：" + "  ".join(miss_rank))
         if miss_suit:
@@ -1887,19 +1867,22 @@ class HoloToolGUI(tk.Tk):
         # 每個標籤實際的樣板數量。以前這裡只顯示「有沒有自己的樣板」，
         # 於是「有 3 個檔案但 2 個是裁壞的小點、真正拿來比對只有 1 張」
         # 這種狀況完全看不出來 —— 而那正是方塊被認成愛心的原因。
-        inventory = part_inventory(PARTS_DIR, default_parts_dir())
+        # （「本機 vs 內建混用」只有樣板主機有這回事；內建模式下這兩份
+        #   提醒講的是一個不存在的問題，直接略過。）
         thin, junky = [], []
-        for kind, title in (("rank", "點數"), ("suit", "花色"), ("pip", "中央大圖案")):
-            for key in sorted(inventory.get(kind, {}), key=lambda k: (len(k), k)):
-                row = inventory[kind][key]
-                # 鬼牌不進這一列：這一列講的是「還在跟內建糊圖混著比對」，
-                # 而內建樣板裡從來就沒有鬼牌，寫進去只會給錯的說明。
-                if key == cardparts.JOKER_RANK:
-                    continue
-                if row["own"] < MIN_OWN_TO_DROP_BUNDLED:
-                    thin.append(f"{title}{key}({row['own']}/{MIN_OWN_TO_DROP_BUNDLED})")
-                if row["junk"]:
-                    junky.append(f"{title}{key}×{row['junk']}")
+        if part_mode == "local":
+            inventory = part_inventory(PARTS_DIR, default_parts_dir())
+            for kind, title in (("rank", "點數"), ("suit", "花色"), ("pip", "中央大圖案")):
+                for key in sorted(inventory.get(kind, {}), key=lambda k: (len(k), k)):
+                    row = inventory[kind][key]
+                    # 鬼牌不進這一列：這一列講的是「還在跟內建糊圖混著比對」，
+                    # 而內建樣板裡從來就沒有鬼牌，寫進去只會給錯的說明。
+                    if key == cardparts.JOKER_RANK:
+                        continue
+                    if row["own"] < MIN_OWN_TO_DROP_BUNDLED:
+                        thin.append(f"{title}{key}({row['own']}/{MIN_OWN_TO_DROP_BUNDLED})")
+                    if row["junk"]:
+                        junky.append(f"{title}{key}×{row['junk']}")
         if thin:
             lines.append(f"自己抓的樣板還不到 {MIN_OWN_TO_DROP_BUNDLED} 張的："
                          + "  ".join(thin))
@@ -2176,6 +2159,18 @@ class HoloToolGUI(tk.Tk):
             self.log_text.see(tk.END)
             self.log_text.config(state=tk.DISABLED)
             drained += 1
+        if drained:
+            # 執行紀錄只保留最近幾千行。掛機一整晚 log 有上萬行，全部留在
+            # Text 元件裡會讓記憶體與捲動都越來越重 —— 完整紀錄本來就在
+            # logs\bot_*.log，畫面上只要看得到近況即可。
+            try:
+                total = int(self.log_text.index("end-1c").split(".")[0])
+                if total > 4000:
+                    self.log_text.config(state=tk.NORMAL)
+                    self.log_text.delete("1.0", f"{total - 3000}.0")
+                    self.log_text.config(state=tk.DISABLED)
+            except (tk.TclError, ValueError):
+                pass
 
         while True:
             try:
@@ -2206,10 +2201,23 @@ class HoloToolGUI(tk.Tk):
         self.after(500, self._pump)
 
     def _refresh_stats(self) -> None:
+        # 這個函式每 0.5 秒被 _pump 呼叫一次。統計檔沒變就不要重讀 ——
+        # 舊寫法是無條件 DailyStats()（開檔 + 解析整份 JSON，含最多 500 筆
+        # 事件），等於 GUI 開著就永遠每秒做兩次沒有意義的磁碟 IO。
+        # 用 (路徑, mtime, size) 當簽名：檔名含日期，跨日也會自動換。
         try:
+            path = stats_today_path()
+            try:
+                st = os.stat(path)
+                signature = (path, st.st_mtime_ns, st.st_size)
+            except OSError:
+                signature = (path, None, None)   # 檔案還不存在（今天還沒玩）
+            if signature == getattr(self, "_stats_signature", None):
+                return
             stats = DailyStats()
         except Exception:
             return
+        self._stats_signature = signature
         data = stats.data
         observed = sum(data.get("card_counts", {}).values())
         guesses = sum(1 for e in data.get("events", []) if e.get("kind") == "highlow_guess")

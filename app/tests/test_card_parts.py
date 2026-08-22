@@ -232,6 +232,8 @@ class TestWithShippedTemplates(unittest.TestCase):
         認不出來是安全的（下一輪重讀），認錯不是。
         """
         rows = [r for r in self._read_all() if r[1][0] not in "JQK"]
+        if not rows:
+            self.skipTest("debug_captures 裡沒有可用的截圖")
         ok = sum(1 for _, lab, hit in rows if hit is not None and hit[0] == lab)
         wrong = [f"{n} 期望 {lab} 卻讀成 {hit[0]}"
                  for n, lab, hit in rows if hit is not None and hit[0] != lab]
@@ -251,6 +253,8 @@ class TestWithShippedTemplates(unittest.TestCase):
         角落樣板，那幾個標籤就會改用你自己的圖。
         """
         rows = [r for r in self._read_all() if r[1][0] in "JQK"]
+        if not rows:
+            self.skipTest("debug_captures 裡沒有可用的截圖")
         rank_wrong = [f"{n} 期望 {lab} 卻讀成 {hit[0]}"
                       for n, lab, hit in rows
                       if hit is not None and hit[0][:-1] != lab[:-1]]
@@ -275,6 +279,8 @@ class TestWithShippedTemplates(unittest.TestCase):
         就不該再混進內建的糊圖。
         """
         samples = _all_samples()
+        if not samples:
+            self.skipTest("debug_captures 裡沒有可用的截圖")
         wrong = []
         for key, label, parts in samples:
             bank = {"rank": {}, "suit": {}, "pip": {}}

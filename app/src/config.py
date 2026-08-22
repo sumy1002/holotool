@@ -79,8 +79,17 @@ DEFAULT_CONFIG = {
     # 撲克規則假設：A 是否視為最大的牌（若遊戲中 A 也可當最小牌，之後可再調整策略）
     "ace_high": True,
 
-    # 主迴圈每次偵測畫面的間隔秒數，太小會佔用過多CPU，太大會反應變慢
+    # 主迴圈每次偵測畫面的間隔秒數，太小會佔用過多CPU，太大會反應變慢。
+    # 2026-08-22 起這是「節拍」而不是「睡眠」：sleep 會扣掉辨識本身花掉的
+    # 時間，所以實際節奏就是這個數字，不會再多墊一個辨識耗時。
     "capture_interval_sec": 0.4,
+
+    # 「有事發生時」的加速偵測間隔（秒）。以下三種情況會暫時改用這個節奏：
+    # 按完「替換」在等結果、手牌/比大小讀到第一拍正在等第二拍確認、
+    # 畫面剛切換或剛點過按鈕的兩秒內。其餘時間維持上面的基本節奏，
+    # 所以平均 CPU 幾乎不變，但看到畫面→做出動作的延遲砍掉一大截。
+    # 設成跟 capture_interval_sec 一樣大 = 關掉加速。
+    "capture_fast_interval_sec": 0.15,
 
     # 「整張卡面」樣板比對的相似度門檻 (0~1)，數值越高越嚴格。
     #
@@ -106,6 +115,17 @@ DEFAULT_CONFIG = {
     # 0.9 以上；真正在把關的是「領先第二名多少」，絕對門檻只是最後一道保險。
     "part_min_score": 0.72,
     "part_min_margin": 0.05,
+
+    # 卡牌（點數/花色）樣板的來源。2026-08-22 起這批樣板**隨程式發布**：
+    # 打包時 build_exe.py 會把主機上實際生效的那一套同步進 defaults\parts\。
+    #   auto    = 自動判斷（預設）。exe 旁找得到原始碼專案（app\packaging\）
+    #             就是「樣板主機」→ 用本機 card_templates\parts\ 蒐集的
+    #             （立即生效、繼續累積，這一套就是發布的資料來源）；
+    #             找不到（zip / 安裝檔裝的其他電腦）→ 用內建 defaults\parts\，
+    #             本機蒐集的不參與比對（檔案不會被刪，只是不用）。
+    #   local   = 強制用本機蒐集的（別台電腦想自己蒐集時設這個）
+    #   bundled = 強制用內建的
+    "card_template_source": "auto",
 
     # 六個畫面標記各自的比對門檻。它們的對比度與背景複雜度差很多，
     # 共用同一個門檻一定會有人過不了、有人誤判，所以拆開來調。
@@ -400,7 +420,12 @@ def _apply_retuning(cfg: dict, old_version: int) -> list[str]:
             new_value = DEFAULT_CONFIG.get(field)
             if new_value is not None and cfg.get(field) != new_value:
                 changed.append(f"{field} {cfg.get(field)} → {new_value}")
-                cfg[field] = new_value
+                # 一定要放**複本**進 cfg，不能直接放 DEFAULT_CONFIG 裡的物件。
+                # marker_thresholds 這類欄位是 dict —— 直接指過去的話，之後
+                # GUI 改 cfg["marker_thresholds"]["xxx"] 會連 DEFAULT_CONFIG
+                # 一起改掉，「還原成預設值」與同一個行程裡的下一次升級比對
+                # 就都對著被污染過的預設值在跑。
+                cfg[field] = json.loads(json.dumps(new_value))
     return changed
 
 

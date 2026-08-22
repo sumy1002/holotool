@@ -74,6 +74,26 @@ def ensure_runtime_dirs() -> None:
     os.makedirs(os.path.join(project_root(), "debug_captures"), exist_ok=True)
 
 
+def is_master_install() -> bool:
+    """這份安裝是不是「樣板主機」＝旁邊找得到原始碼專案。
+
+    卡牌（點數/花色）樣板從 2026-08-22 起是**隨程式發布**的：打包時
+    `build_exe.py` 會把主機上實際生效的那一套同步進 `defaults/parts/`，
+    其他電腦一律改吃內建的（見 `recognize.resolve_part_source`）。
+
+    「主機」的判斷：直接跑原始碼一定是主機；打包後的 exe 若住在原始碼樹裡
+    （開發者自己的 `app\\dist\\HoloTool\\`，往上兩層找得到 `packaging\\
+    build_exe.py`）也是主機 —— 他在 GUI 蒐集的樣板要立即生效、繼續累積，
+    那正是要送給其他人的資料來源。用 zip / 安裝檔裝到別台電腦的副本
+    旁邊沒有原始碼，自然判成「其他電腦」。
+    """
+    if not getattr(sys, "frozen", False):
+        return True
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    probe = os.path.join(exe_dir, os.pardir, os.pardir, "packaging", "build_exe.py")
+    return os.path.isfile(probe)
+
+
 def default_ui_dir() -> str:
     return os.path.join(project_root(), "defaults", "ui")
 

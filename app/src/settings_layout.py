@@ -35,7 +35,9 @@ THRESHOLD_FIELDS: list[tuple[str, str, str]] = [
 ]
 
 TIMING_FIELDS: list[tuple[str, str, str]] = [
-    ("capture_interval_sec", "畫面偵測間隔（秒）", "越小反應越快，但越吃 CPU"),
+    ("capture_interval_sec", "畫面偵測間隔（秒）", "平時的偵測節奏。越小反應越快，但越吃 CPU"),
+    ("capture_fast_interval_sec", "偵測間隔-加速（秒）",
+     "等結果、等確認拍、畫面剛換時暫用的快節奏。設成跟上面一樣大 = 關掉加速"),
     ("action_cooldown_sec", "動作冷卻（秒）", "點完後至少等這麼久；遊戲跑得慢就調大，避免亂點"),
     ("action_retry_sec", "漏收重試（秒）", "同一個畫面卡這麼久沒變，就再點一次"),
     ("idle_confirm_sec", "待機確認（秒）", "畫面連續認不出來這麼久，才會去點「投注並開始」"),

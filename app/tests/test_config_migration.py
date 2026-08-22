@@ -77,6 +77,26 @@ class TestConfigMigration(unittest.TestCase):
         self.assertIn("draw_result_wait_sec", loaded)
         self.assertEqual(loaded["capture_client_width"], 1843)
 
+    def test_retuning_does_not_alias_default_config(self):
+        """升級塞回來的 dict 欄位必須是**複本**，不能跟 DEFAULT_CONFIG 共用物件。
+
+        marker_thresholds 是 dict。如果 _apply_retuning 直接把 DEFAULT_CONFIG
+        裡的那個 dict 指給 cfg，之後 GUI 一改門檻，整個行程的「預設值」就跟著
+        被改掉 —— 「還原成預設值」按鈕與下一次升級比對都會對著髒資料。
+        """
+        import copy
+        pristine = copy.deepcopy(cfg_mod.DEFAULT_CONFIG["marker_thresholds"])
+        stored = {
+            "config_version": 5,      # < 6，會觸發 marker_thresholds 的強制覆蓋
+            "marker_thresholds": {"table_marker": 0.99},
+        }
+        loaded, _ = self._load_with(stored)
+        self.assertIsNot(loaded["marker_thresholds"],
+                         cfg_mod.DEFAULT_CONFIG["marker_thresholds"])
+        loaded["marker_thresholds"]["table_marker"] = 0.01   # 模擬 GUI 改設定
+        self.assertEqual(cfg_mod.DEFAULT_CONFIG["marker_thresholds"], pristine,
+                         "改了載入後的設定，DEFAULT_CONFIG 竟然跟著變")
+
 
 if __name__ == "__main__":
     unittest.main()

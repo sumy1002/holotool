@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -165,6 +166,44 @@ class TestPriorityAndSafety(DailyLimitTestCase):
         self.assertNotIn("max_win_retry", keys)
         self.assertTrue(bot.running)
         self.assertEqual(bot.stats.data["max_win_count"], 0)
+
+
+class TestCountingIsIndependentOfActing(DailyLimitTestCase):
+    """計數不可以綁在「有沒有按到按鈕」上。
+
+    舊寫法用 `_acted_state != "max_win"` 判斷「第一次看到」，但那個狀態只有
+    真的點擊（_act）之後才會變。上限畫面若出現在上一個動作的冷卻期內
+    （例如按完「大」不到 1.2 秒就跳結算），`_should_act` 擋下點擊、狀態停在
+    舊值 —— 於是**每個 tick 都 +1**，兩三拍就把當天兩次的額度記滿，
+    然後在只達標一次的情況下自動收工。
+    """
+
+    def test_arriving_during_cooldown_counts_exactly_once(self):
+        bot = self._make_bot(already_done=0)
+        bot._acted_state = "highlow:8H"      # 剛按過「大」
+        bot._acted_at = time.time()          # 冷卻期內，點不了「再玩一次」
+        self._run(bot, _frame(is_max_win=True), ticks=5)
+        self.assertEqual(bot.stats.data["max_win_count"], 1,
+                         "冷卻期內的重複 tick 被重複計數了")
+        self.assertTrue(bot.running, "只達標一次就把整天的額度記滿而收工")
+
+    def test_marker_flicker_does_not_recount(self):
+        """標記閃爍（中間幾拍什麼都認不出來）不算「新的一次」。"""
+        bot = self._make_bot(already_done=0)
+        self._run(bot, _frame(is_max_win=True), ticks=3)
+        self._run(bot, _frame(), ticks=2)               # 什麼畫面都認不出來
+        self._run(bot, _frame(is_max_win=True), ticks=3)
+        self.assertEqual(bot.stats.data["max_win_count"], 1)
+
+    def test_a_real_second_max_win_is_still_counted(self):
+        """中間真的換過畫面（回去又玩了一輪）→ 第二次要照算。"""
+        bot = self._make_bot(already_done=0)
+        self._run(bot, _frame(is_max_win=True), ticks=2)
+        self.assertEqual(bot.stats.data["max_win_count"], 1)
+        self._run(bot, _frame(is_congrats=True), ticks=2)   # 已確定切到別的畫面
+        self._run(bot, _frame(is_max_win=True), ticks=2)
+        self.assertEqual(bot.stats.data["max_win_count"], 2)
+        self.assertFalse(bot.running, "第二次達標應該收工")
 
 
 class TestStatsPersistence(unittest.TestCase):

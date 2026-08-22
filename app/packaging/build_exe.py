@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -117,8 +118,22 @@ def _differs(a: str, b: str) -> bool:
         return True
 
 
-def _keep_backup(path: str) -> None:
-    """把即將被取代（或被冷落）的那份留下來，檔名帶編號，不會互相覆蓋。"""
+# 同一個檔案最多留幾份 .bak。這種備份每次打包只要「兩邊內容不同」就會多一份，
+# 而使用者一天可以發好幾版 —— 不設上限的話 config.json.bak1、bak2、bak3…
+# 會無限堆下去（實機已經堆到 .bak3）。留最近幾份就足以救回「同步同錯邊」的意外。
+KEEP_BAK_PER_FILE = 3
+
+# 只認「.bak」「.bak<數字>」這種我們自己產生的檔名。
+# 使用者手動留的備份（例如 config.json.bak-before-profiles）一律不碰。
+_BAK_SUFFIX = re.compile(r"\.bak\d*$")
+
+
+def _keep_backup(path: str, keep: int = KEEP_BAK_PER_FILE) -> None:
+    """把即將被取代（或被冷落）的那份留下來，檔名帶編號，不會互相覆蓋。
+
+    另外把同一個檔案「太舊的 .bak」清掉，只留最近 `keep` 份 ——
+    這是打包流程唯一會自己長出來的垃圾，得自己收。
+    """
     base = path + ".bak"
     i = 0
     candidate = base
@@ -130,7 +145,101 @@ def _keep_backup(path: str) -> None:
         print(f"  [保留] {os.path.basename(path)} 兩邊內容不同，"
               f"已備份成 {os.path.basename(candidate)}")
     except OSError:
-        pass
+        return
+    _prune_baks(path, keep)
+
+
+def _prune_baks(path: str, keep: int = KEEP_BAK_PER_FILE) -> list[str]:
+    """同一個檔案的 .bak / .bakN 只留「最新的 keep 份」，回傳刪掉的檔名。"""
+    if keep < 1:
+        return []
+    folder = os.path.dirname(path) or "."
+    stem = os.path.basename(path)
+    baks = []
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return []
+    for name in names:
+        if not name.startswith(stem):
+            continue
+        suffix = name[len(stem):]
+        if not _BAK_SUFFIX.fullmatch(suffix):
+            continue
+        full = os.path.join(folder, name)
+        try:
+            baks.append((os.path.getmtime(full), name, full))
+        except OSError:
+            continue
+    baks.sort(reverse=True)                    # 新的在前
+    removed: list[str] = []
+    for _mtime, name, full in baks[keep:]:
+        try:
+            os.remove(full)
+            removed.append(name)
+        except OSError:
+            pass
+    if removed:
+        print(f"  [清理] {stem} 的舊備份已超過 {keep} 份，"
+              f"刪掉最舊的 {len(removed)} 份：{'、'.join(removed)}")
+    return removed
+
+
+def _publish_parts_to_defaults() -> None:
+    """把主機上「實際生效」的點數/花色樣板同步進 defaults\\parts\\。
+
+    卡牌樣板隨程式發布（2026-08-22 的決定）：其他電腦一律吃 defaults\\parts\\
+    （`recognize.resolve_part_source`），所以打包前要讓那個資料夾等於主機
+    目前真正拿來比對的那一套 —— 不是 card_templates\\parts\\ 整包照搬：
+    那裡面可能還躺著「已被自己的樣板整組取代」的內建糊圖，全搬等於把主機上
+    已經淘汰的糊圖重新混回其他電腦的比對池。挑選規則由
+    `cardparts.select_effective_parts()` 提供，跟載入邏輯一對一。
+
+    護欄：來源資料夾不存在或一張可用的都沒有（例如從全新 checkout 打包）
+    就**完全不動** defaults\\ —— 寧可帶舊資料，也不要把內建樣板清空。
+    """
+    src = os.path.join(ROOT, "card_templates", "parts")
+    dst = os.path.join(ROOT, "defaults", "parts")
+    if ROOT not in sys.path:
+        sys.path.insert(0, ROOT)
+    from src.cardparts import RANKS, SUITS, parse_part_name, select_effective_parts
+
+    files = select_effective_parts(src, dst)
+    if not files:
+        print("[樣板發布] card_templates\\parts 沒有可用的樣板，defaults\\parts 保持原樣")
+        return
+    os.makedirs(dst, exist_ok=True)
+    wanted = set(files)
+    added = updated = removed = 0
+    for name in files:
+        s = os.path.join(src, name)
+        d = os.path.join(dst, name)
+        if not os.path.exists(d):
+            shutil.copy2(s, d)
+            added += 1
+        elif _differs(s, d):
+            shutil.copy2(s, d)
+            updated += 1
+    for name in os.listdir(dst):
+        # 只清「點數/花色樣板檔」；其他檔案（說明、壓縮包…）一律不碰
+        if name in wanted or parse_part_name(name) is None:
+            continue
+        try:
+            os.remove(os.path.join(dst, name))
+            removed += 1
+        except OSError:
+            pass
+
+    have_rank = {parse_part_name(n)[1] for n in wanted if parse_part_name(n)[0] == "rank"}
+    have_suit = {parse_part_name(n)[1] for n in wanted if parse_part_name(n)[0] == "suit"}
+    holes = [f"點數 {r}" for r in RANKS if r not in have_rank]
+    holes += [f"花色 {s}" for s in SUITS if s not in have_suit]
+    print(f"[樣板發布] defaults\\parts ← 主機實際生效的 {len(wanted)} 張"
+          f"（新增 {added}、更新 {updated}、移除 {removed}）"
+          "—— 其他電腦更新後就吃這一套")
+    if holes:
+        print(f"[樣板發布] ⚠ 這一套還缺：{'、'.join(holes)} —— "
+              "其他電腦遇到缺的那幾張會認不出來，建議先在主機補齊再發版")
 
 
 def _report_card_slots() -> None:
@@ -360,6 +469,9 @@ def main() -> None:
     moved = _promote_runtime_data()
     if moved:
         print(f"已把 {moved} 個較新的校準/樣板檔從 dist 搬回 app\\（避免打包時被清掉）")
+    # 一定要排在 _promote_runtime_data() 之後：主機平常玩的是 dist 那份 exe，
+    # 最新蒐集的樣板剛剛才被搬回 app\card_templates\，現在發布的才是最新的。
+    _publish_parts_to_defaults()
     _report_card_slots()
 
     python = _find_python()

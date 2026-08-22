@@ -73,7 +73,10 @@ class GameCapture:
         abs_box = {"left": rect.left, "top": rect.top, "width": rect.width, "height": rect.height}
         shot = self._sct.grab(abs_box)
         arr = np.array(shot)
-        return arr[:, :, :3]
+        # BGRA 切掉 alpha 之後是「非連續」的視圖，後面每一次 cvtColor /
+        # matchTemplate 都得自己再複製一次。這裡一次轉成連續記憶體，
+        # 同一張畫面在一個 tick 裡會被裁十幾次，划得來。
+        return np.ascontiguousarray(arr[:, :, :3])
 
     def ratio_point_to_absolute(self, point: dict) -> tuple[int, int]:
         """把比例座標點 (x, y 皆為 0~1) 轉成螢幕絕對座標（點擊用）。"""

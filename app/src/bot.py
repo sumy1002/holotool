@@ -27,6 +27,7 @@ from .recognize import (
     load_part_templates,
     load_single_template,
     part_sources,
+    resolve_part_source,
 )
 from .state_machine import IDLE_SLOT_MAX_VALUE, detect_frame, expected_marker_scale
 from .stats import DailyStats
@@ -56,7 +57,7 @@ class Bot:
             ),
         )
         self.card_templates = load_card_templates()
-        self.part_templates = load_part_templates()
+        self.part_templates = load_part_templates(cfg=config)
         self.reader = self._build_reader()
         self.ui_templates = self._load_ui_templates(config)
         self.stats = DailyStats()
@@ -95,6 +96,23 @@ class Bot:
         # 那個只有按 F9 啟動時才會跑，測試與任何提早進入的路徑都會 AttributeError。
         self._partial_draw_signature: tuple | None = None
         self._partial_draw_since: float | None = None
+
+        # 這一次「持續看到的上限畫面」計過數了沒（見 _handle_max_win）。
+        self._max_win_counted = False
+
+        # ---- 自適應偵測節奏（見 run_forever / _wants_fast_tick）----
+        # 這一拍是用哪種間隔跑的：權重 = 實際間隔 ÷ 基本間隔。
+        # 「離桌判定」的累計用它換算，快拍不會讓 10 秒的判定縮成 4 秒。
+        # 測試直接呼叫 _tick() 時維持 1.0 = 與固定節奏完全相同的行為。
+        self._tick_weight = 1.0
+        self._tick_was_fast = False
+        self._pending_slot_since = 0.0
+        self._pending_highlow_since = 0.0
+        self._last_seen_state: str | None = None
+        self._last_state_change_at = 0.0
+        self._last_status_log_at = 0.0
+        self._last_missing_explain_at = 0.0
+        self._last_idle_explain_at = 0.0
 
         if self.ui_templates.get("table_marker") is None:
             log("[警告] 尚未設定牌桌標記樣板 (table_marker.png)，將無法自動偵測『已達每日上限』，請先完成校準。")
@@ -209,6 +227,13 @@ class Bot:
             log(f"=== 已啟動 (F9)，{mode} ===")
             loaded = [name for name, img in self.ui_templates.items() if img is not None]
             card_n = sum(len(v) for v in self.card_templates.values())
+            _src_dir, _bundled, part_mode = resolve_part_source(self.cfg)
+            log("樣板來源：" + (
+                "本機蒐集（這一台是樣板主機，蒐集立即生效，打包時會隨程式發布）"
+                if part_mode == "local" else
+                "內建（開發者隨程式提供，更新程式就會更新樣板；"
+                "本機蒐集的不參與比對）"
+            ))
             miss_rank, miss_suit = missing_parts(self.part_templates)
             n_rank = len(self.part_templates.get("rank") or {})
             n_suit = len(self.part_templates.get("suit") or {})
@@ -232,8 +257,11 @@ class Bot:
                     f"花色 {('、'.join(miss_suit) or '無')}。"
                     "缺的那些牌會辨識失敗，可到「點數/花色樣板」分頁補齊。"
                 )
-            self._report_part_sources()
-            self._report_unusable_parts()
+            if part_mode == "local":
+                # 這兩份報告講的是「本機蒐集 vs 內建墊背」的混用狀況，
+                # 只有樣板主機有這回事；其他電腦整套都是內建的，講了只會誤導。
+                self._report_part_sources()
+                self._report_unusable_parts()
             self._report_marker_scale()
             limit = int(self.cfg.get("daily_max_wins", 2))
             done = self._max_win_count()
@@ -333,6 +361,16 @@ class Bot:
         self._idle_since = None
         self._partial_draw_signature = None
         self._partial_draw_since = None
+        self._max_win_counted = False
+        self._tick_weight = 1.0
+        self._tick_was_fast = False
+        self._pending_slot_since = 0.0
+        self._pending_highlow_since = 0.0
+        self._last_seen_state = None
+        self._last_state_change_at = 0.0
+        self._last_status_log_at = 0.0
+        self._last_missing_explain_at = 0.0
+        self._last_idle_explain_at = 0.0
 
     # ---------- 動作節奏 ----------
 
@@ -379,17 +417,73 @@ class Bot:
 
     # ---------- 主迴圈 ----------
 
+    # 「畫面剛變過」之後維持快拍多久。狀態一換（或剛點過按鈕），下一個畫面
+    # 通常在一兩秒內出現，這段期間用快拍去接；過了就退回基本節奏省 CPU。
+    FAST_STATE_WINDOW_SEC = 2.0
+
+    def _wants_fast_tick(self) -> bool:
+        """下一拍要不要用快的偵測間隔？
+
+        原本的主迴圈是固定 0.4 秒一拍，反應時間全被它墊高：看到新畫面平均要
+        等 0.2 秒、選牌/比大小的「連續兩拍相同才動作」又要再等一整拍。
+        現在辨識一拍只要幾十毫秒（2026-08-22 的效能整理），撐得起「有事發生
+        時拍快一點」：
+
+        * 按完「替換」在等結果 —— 結果畫面越早看到，下一步越早開始
+        * 手牌／比大小已經讀到第一拍，正在等第二拍確認 —— 這一拍直接決定
+          什麼時候可以動作
+        * 畫面剛換過（或剛點過按鈕）—— 下一個畫面多半馬上到
+
+        其餘時間（投注畫面掛著、完全待機）維持基本節奏。所以快拍只出現在
+        「本來就在忙」的那幾秒，平均 CPU 幾乎不變，反應時間卻砍掉一大截。
+        """
+        now = time.time()
+        if self._awaiting_draw_result:
+            return True
+        # 「等第二拍確認」只算最近這幾秒的 —— pending 計數只有下一次進到
+        # 選牌/比大小階段才會被覆蓋，畫面若中途切走，一個過期的 pending==1
+        # 會把快拍釘死在開的狀態。
+        if (self._pending_slot_count == 1
+                and now - self._pending_slot_since < 3.0):
+            return True
+        if (self._pending_highlow_count == 1
+                and now - self._pending_highlow_since < 3.0):
+            return True
+        if now - self._last_state_change_at < self.FAST_STATE_WINDOW_SEC:
+            return True
+        if now - self._acted_at < self.FAST_STATE_WINDOW_SEC:
+            return True
+        return False
+
     def run_forever(self) -> None:
-        interval = self.cfg.get("capture_interval_sec", 0.4)
         log("Bot 已就緒，按 F9 開始/停止，按 F10 緊急停止，按 Ctrl+C 結束程式。")
+        # 這一拍距離上一拍實際等了多久（= 上一輪選的間隔）。
+        # 第一拍之前沒有等待，當成基本間隔。
+        gap_before_tick = max(0.05, float(self.cfg.get("capture_interval_sec", 0.4)))
         while not self._stop_flag.is_set():
-            time.sleep(interval)
+            base = max(0.05, float(self.cfg.get("capture_interval_sec", 0.4)))
             if not self.running:
+                time.sleep(base)
+                gap_before_tick = base
                 continue
+            # 權重描述「這一拍代表多少牆鐘時間」，給離桌判定等累計用；
+            # was_fast 描述「這一拍跟上一拍靠得多近」，給確認拍的最短間隔用。
+            self._tick_weight = gap_before_tick / base
+            self._tick_was_fast = gap_before_tick < base
+            started = time.time()
             try:
                 self._tick()
             except Exception as e:  # noqa: BLE001
                 log(f"[錯誤] 主迴圈發生例外: {e!r}")
+            # 下一拍要等多久，用「這一拍看完之後」的狀態決定 —— 正在等結果、
+            # 等第二拍確認、畫面剛換過，就用快的間隔去接。
+            fast = min(base, max(0.05, float(
+                self.cfg.get("capture_fast_interval_sec", 0.15))))
+            next_gap = fast if self._wants_fast_tick() else base
+            # 固定節拍：sleep 扣掉這一拍實際花掉的時間。舊寫法是「睡滿 interval
+            # 再工作」，等於每拍多墊一個辨識耗時（幾十到一百多毫秒）。
+            time.sleep(max(0.02, next_gap - (time.time() - started)))
+            gap_before_tick = next_gap
 
     def stop_program(self) -> None:
         self._stop_flag.set()
@@ -401,7 +495,7 @@ class Bot:
             self.dry_run = dry_run
         self.capture.window_title_substring = config.get("window_title_substring", "")
         self.card_templates = load_card_templates()
-        self.part_templates = load_part_templates()
+        self.part_templates = load_part_templates(cfg=config)
         self.reader = self._build_reader()
         self.ui_templates = self._load_ui_templates(config)
 
@@ -438,6 +532,21 @@ class Bot:
         frame = detect_frame(self.capture, self.cfg, self.reader, self.ui_templates)
         self._status_ticks += 1
 
+        # 記住「現在看起來是哪個畫面」。一變動就開一段快拍窗（_wants_fast_tick），
+        # 讓下一個畫面被更快接住。'none'（什麼都認不出來）也是一種狀態 ——
+        # 選牌 → 動畫（none）→ 比大小 的每一次轉換都算。
+        state_now = ("max_win" if frame.is_max_win
+                     else "poker_fail" if frame.is_poker_fail
+                     else "fail" if frame.is_fail
+                     else "challenge" if frame.is_challenge
+                     else "congrats" if frame.is_congrats
+                     else "draw" if frame.is_draw
+                     else "highlow" if frame.highlow_card is not None
+                     else "none")
+        if state_now != self._last_seen_state:
+            self._last_seen_state = state_now
+            self._last_state_change_at = time.time()
+
         if frame.on_table:
             self._logo_ever_matched = True
             self._missing_table_ticks = 0
@@ -449,7 +558,14 @@ class Bot:
         if self._status_ticks == 1:
             log(f"畫面標記樣板縮放倍率 = {frame.ui_scores.get('_scale', 1.0):.2f}x")
 
-        if self._status_ticks == 1 or self._status_ticks % 8 == 0:
+        status_due = self._status_ticks == 1 or self._status_ticks % 8 == 0
+        if (status_due and self._tick_was_fast
+                and time.time() - self._last_status_log_at < 2.5):
+            # 快拍模式下 tick 數跑得快，「偵測中」那行照 %8 印會刷版；
+            # 用時間再閘一次。慢拍（含測試直接呼叫 _tick）行為完全不變。
+            status_due = False
+        if status_due:
+            self._last_status_log_at = time.time()
             scores = frame.ui_scores
             n_cards = sum(1 for s in frame.slot_cards if s is not None)
             hl = frame.highlow_card[0] if frame.highlow_card else "-"
@@ -475,6 +591,12 @@ class Bot:
             self._awaiting_draw_result = False
             self._handle_max_win()
             return
+        if self._max_win_counted and (
+            frame.any_dialog or frame.is_draw or frame.highlow_card is not None
+        ):
+            # 已經確定換到別的畫面了（不是標記閃爍造成的一兩個空拍），
+            # 下一次再看到上限畫面就是新的一次，要重新計數。
+            self._max_win_counted = False
 
         # 對話框會模糊/蓋住 logo，必須先處理
         if frame.is_poker_fail:
@@ -521,7 +643,11 @@ class Bot:
             and not frame.on_table
             and self.ui_templates.get("table_marker") is not None
         ):
-            self._missing_table_ticks += 1
+            # 用「權重」累計而不是 +1：快拍模式下 tick 比較密，直接數拍數會讓
+            # 「25 拍 ≈ 10 秒」的離桌判定縮成三四秒而提早停機。權重 = 這一拍
+            # 代表的牆鐘時間 ÷ 基本間隔，所以無論節奏怎麼切換，門檻對應的
+            # 都是同一段真實時間。（測試直接呼叫 _tick 時權重恆為 1，行為不變。）
+            self._missing_table_ticks += self._tick_weight
             if self._missing_table_ticks >= int(self.cfg.get("exit_table_ticks", 25)):
                 log(
                     f"偵測到已離開牌桌畫面（logo 相似度 {frame.table_marker_score:.0%}，"
@@ -537,7 +663,12 @@ class Bot:
                 self._clear_partial_draw_timer()
                 self._handle_draw_phase(frame)
             else:
-                if self._status_ticks % 8 == 1:
+                explain_due = self._status_ticks % 8 == 1
+                if (explain_due and self._tick_was_fast
+                        and time.time() - self._last_missing_explain_at < 2.5):
+                    explain_due = False   # 快拍時用時間節流，慢拍行為不變
+                if explain_due:
+                    self._last_missing_explain_at = time.time()
                     self._explain_missing_cards(frame)
                 self._handle_partial_draw(frame)
             return
@@ -548,6 +679,15 @@ class Bot:
         self._handle_idle(frame)
 
     # ---------- 各階段處理 ----------
+
+    # 快拍模式下，兩次「確認讀取」至少要隔這麼久。
+    #
+    # 「連續兩拍讀到同一結果才動作」的保護在基本節奏（0.4s）下，兩次取樣
+    # 天然隔了 0.4 秒；快拍 0.15s 會讓兩次取樣靠得太近，萬一正好落在同一段
+    # 過渡動畫裡，兩次都讀到同一個暫態的機率變高。所以快拍時額外要求
+    # 「第一次讀到到現在至少過了 0.25 秒」—— 多等最多一拍，仍遠快於 0.4+0.4。
+    # 慢拍（0.4s ≥ 0.25s）與測試直接呼叫 _tick 的行為完全不變。
+    CONFIRM_MIN_GAP_SEC = 0.25
 
     def _handle_draw_phase(self, frame) -> None:
         labels = tuple(s[0] for s in frame.slot_cards)
@@ -568,8 +708,12 @@ class Bot:
         else:
             self._pending_slot_signature = labels
             self._pending_slot_count = 1
+            self._pending_slot_since = time.time()
         if self._pending_slot_count < 2:
             return  # 需連續兩次讀到相同結果才視為畫面穩定，避免動畫過程誤判
+        if (self._tick_was_fast
+                and time.time() - self._pending_slot_since < self.CONFIRM_MIN_GAP_SEC):
+            return  # 快拍下兩次取樣靠太近，等湊滿最短間隔再確認（見上面的說明）
 
         self._last_slot_signature = labels
         try:
@@ -717,8 +861,12 @@ class Bot:
         else:
             self._pending_highlow_label = label
             self._pending_highlow_count = 1
+            self._pending_highlow_since = time.time()
         if self._pending_highlow_count < 2:
             return
+        if (self._tick_was_fast
+                and time.time() - self._pending_highlow_since < self.CONFIRM_MIN_GAP_SEC):
+            return  # 快拍下兩次取樣靠太近，等湊滿最短間隔（見 CONFIRM_MIN_GAP_SEC）
 
         self._last_highlow_label = label
         try:
@@ -864,8 +1012,18 @@ class Bot:
 
         次數存在當天的統計檔（max_win_count），所以中途重開程式也不會重數。
         """
-        if self._acted_state != "max_win":
-            # 第一次看到這個畫面才計數；同一個畫面的重試不重複累加
+        if not self._max_win_counted:
+            # 這一次「持續看到的上限畫面」只計數一次。
+            #
+            # ⚠️ 以前是用 `self._acted_state != "max_win"` 判斷「第一次看到」，
+            # 但 `_acted_state` 只有在真的按下按鈕（_act）之後才會變 ——
+            # 如果上限畫面出現時剛好還在上一個動作的冷卻期（例如按完「大」
+            # 不到 1.2 秒就跳結算），`_should_act` 會擋下點擊、`_acted_state`
+            # 停在舊值，於是**每個 tick 都再 +1**：兩三拍就把當天兩次的額度
+            # 記滿，然後在只達標一次的情況下自動收工。改用獨立的旗標，
+            # 「看到就記、記過就不再記」，跟有沒有點到按鈕脫鉤。
+            # 旗標要等確定切到別的畫面才清（見 _tick），標記閃爍一兩拍不算。
+            self._max_win_counted = True
             self.stats.bump("max_win_count")
             self.stats.record_event("max_win", {"count": self._max_win_count()})
 
@@ -922,7 +1080,12 @@ class Bot:
         if not frame.looks_like_betting(
             float(self.cfg.get("idle_slot_max_value", IDLE_SLOT_MAX_VALUE))
         ):
-            if self._status_ticks % 12 == 1:
+            explain_due = self._status_ticks % 12 == 1
+            if (explain_due and self._tick_was_fast
+                    and time.time() - self._last_idle_explain_at < 4.0):
+                explain_due = False   # 快拍時用時間節流，慢拍行為不變
+            if explain_due:
+                self._last_idle_explain_at = time.time()
                 shown = frame.slot_values or "（沒量到）"
                 log(f"[待機] 畫面認不出來，但五個牌位的亮度 {shown} 不像投注畫面"
                     f"（要全部 ≤ {self.cfg.get('idle_slot_max_value', IDLE_SLOT_MAX_VALUE)}），"

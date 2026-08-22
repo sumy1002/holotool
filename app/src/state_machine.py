@@ -270,11 +270,27 @@ def detect_frame(
         except Exception:
             slot_cards.append(None)
             continue
-        slot_values.append(median_value(roi))
+        value = median_value(roi)
+        slot_values.append(value)
+        # 蓋著的深色牌背（中位亮度 ≤ IDLE_SLOT_MAX_VALUE）不必讀牌。
+        #
+        # 兩個理由，缺一都值得做：
+        # 1. **正確性**：牌背的圖案偶爾會被角落判讀硬湊成一張真牌
+        #    （實測投注畫面五張蓋牌裡本來就有 1 格會被讀成 AS —— 2026-08-21
+        #    「兩角一致規則」那篇文件記錄過這個假陽性）。牌背不該有牌面，
+        #    直接跳過就把這一類假陽性連根拔掉。
+        # 2. **效能**：投注畫面是 bot 停留最久的狀態，五格角落判讀
+        #    （找卡身 → 切角 → 二值化 → 對整個樣板庫比對）每個 tick 都在
+        #    白做工。實測跳過之後 idle tick 的耗時大約砍半。
+        #
+        # 門檻沿用 IDLE_SLOT_MAX_VALUE 的量測依據：投注畫面最亮 133、
+        # 其他畫面最暗 205（被立繪蓋住的格子除外，而那種格子本來就讀不出來）。
+        # `value < 0` 代表沒量到（擷取失敗），不能當成「很暗」，照常去讀。
+        if 0 <= value <= IDLE_SLOT_MAX_VALUE:
+            slot_cards.append(None)
+            continue
         h, w = roi.shape[:2]
         slot_cards.append(reader.read(roi, w, h))
-
-    highlow_result = _recognize_highlow_card(capture, cfg, reader)
 
     # 「選擇要保留的牌吧！」這行字後面的背景光暈每一局都不太一樣，實測分數會在
     # 0.57 ~ 0.99 之間跳動。門檻設高會漏掉，設低又會在投注畫面誤判而卡住。
@@ -284,6 +300,12 @@ def detect_frame(
     if not is_draw and sum(1 for s in slot_cards if s is not None) == 5:
         soft = float(cfg.get("draw_prompt_soft_threshold", 0.50))
         is_draw = scores["draw_prompt"] >= soft
+
+    # 已經確定是選牌畫面就不用掃比大小的牌 —— 兩個畫面不可能同時存在，而
+    # 比大小的掃描區在選牌畫面上會蓋到手牌與亮色面板，白白多花 15~20ms 去
+    # 找卡身、切角落。bot 端本來就把 is_draw 排在 highlow 之前處理，所以
+    # is_draw 成立時 highlow_card 的值從來不會被用到，跳過不改變任何行為。
+    highlow_result = None if is_draw else _recognize_highlow_card(capture, cfg, reader)
 
     return FrameInfo(
         on_table=on_table,

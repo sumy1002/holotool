@@ -308,6 +308,99 @@ def build_patch_zip(out_dir: str, version: str, full_zip: str):
     return zip_path
 
 
+# ------------------------------------------------------------ 舊產物清理
+#
+# 每發一版就多一個 76 MB 的整包 zip；release.bat 又會在磁碟根目錄留一份
+# `holotool-test-<版本>\`（約 120 MB 的完整 build，拿來測自動更新用）。
+# 都不清的話，發 20 版就是好幾 GB 的死資料。
+#
+# 差分功能只需要「最近的上一版」當基準，所以各保留最近 KEEP_RELEASES 份
+# 就綽綽有餘 —— 再舊的基準做出來的差分也不會被任何人用到
+# （updater 只認「基底 == 目前安裝版本」的差分包）。
+KEEP_RELEASES = 2
+
+
+def prune_old_releases(out_dir: str, keep: int = KEEP_RELEASES) -> list[str]:
+    """刪掉太舊的整包 / 差分 zip（連同 .sha256），回傳刪掉的檔名。
+
+    規則：整包 zip 依版本新→舊排序，保留前 `keep` 個；差分包只保留
+    「目標版本還在保留名單裡」的那些。剛打包出來的一定是最新版，永遠在名單裡。
+    """
+    if keep < 1 or not os.path.isdir(out_dir):
+        return []
+    fulls: list[tuple[tuple, str]] = []
+    patches: list[tuple[str, str]] = []       # (目標版本, 檔名)
+    for name in os.listdir(out_dir):
+        if not (name.startswith("HoloTool-") and name.lower().endswith(".zip")):
+            continue
+        parsed = parse_patch_asset_name(name)
+        if parsed is not None:
+            patches.append((parsed[0], name))
+        else:
+            fulls.append((version_tuple(name[len("HoloTool-"):-len(".zip")]), name))
+
+    fulls.sort(reverse=True)
+    kept_versions = {v for v, _n in fulls[:keep]}
+    victims = [n for _v, n in fulls[keep:]]
+    victims += [n for target, n in patches
+                if version_tuple(target) not in kept_versions]
+
+    removed: list[str] = []
+    for name in victims:
+        for path in (os.path.join(out_dir, name),
+                     os.path.join(out_dir, name + ".sha256")):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                    removed.append(os.path.basename(path))
+            except OSError:
+                pass
+    return removed
+
+
+def prune_test_copies(keep: int = KEEP_RELEASES,
+                      neighbours: str | None = None) -> list[str]:
+    """刪掉太舊的 `holotool-test-<版本>\\` 資料夾，回傳刪掉的資料夾名。
+
+    三道保險，寧可少刪不可誤刪：
+      · 名稱必須是 `holotool-test-` 開頭而且版本號解析得出來
+      · 裡面必須真的有 HoloTool.exe（確定是一份 build，不是別人的資料夾）
+      · 依版本新→舊排序，保留前 `keep` 個
+    """
+    if keep < 1:
+        return []
+    base = neighbours if neighbours is not None else (os.path.dirname(PROJECT) or PROJECT)
+    prefix = "holotool-test-"
+    found: list[tuple[tuple, str]] = []
+    try:
+        entries = os.listdir(base)
+    except OSError:
+        return []
+    for name in entries:
+        if not name.lower().startswith(prefix):
+            continue
+        full = os.path.join(base, name)
+        if not os.path.isdir(full):
+            continue
+        parsed = version_tuple(name[len(prefix):])
+        if parsed == (0, 0, 0):
+            continue                        # 版本號看不懂的不敢動
+        if not os.path.exists(os.path.join(full, SENTINEL)):
+            continue                        # 不是 HoloTool 的 build，不敢動
+        found.append((parsed, full))
+
+    found.sort(reverse=True)
+    removed: list[str] = []
+    import shutil
+    for _version, full in found[keep:]:
+        try:
+            shutil.rmtree(full)
+            removed.append(os.path.basename(full))
+        except OSError:
+            pass
+    return removed
+
+
 def write_sha256(zip_path: str) -> str:
     digest = hashlib.sha256()
     with open(zip_path, "rb") as f:
@@ -330,6 +423,10 @@ def main() -> None:
     parser.add_argument("--installer", action="store_true",
                         help="順便產生 HoloToolSetup.exe（給第一次安裝的人）")
     parser.add_argument("--out", default=DIST, help="輸出資料夾，預設 app\\dist")
+    parser.add_argument("--no-prune", action="store_true",
+                        help="不要清掉舊版的 zip 與 holotool-test-* 測試資料夾")
+    parser.add_argument("--keep-releases", type=int, default=KEEP_RELEASES,
+                        help=f"保留最近幾版的 zip 與測試資料夾（預設 {KEEP_RELEASES}）")
     args = parser.parse_args()
 
     version = __version__
@@ -349,6 +446,16 @@ def main() -> None:
 
     patch_path = build_patch_zip(args.out, version, zip_path)
     patch_sha = write_sha256(patch_path) if patch_path else ""
+
+    if not args.no_prune:
+        # 清舊產物一定要排在差分包**做完之後** —— 差分要拿上一版的 zip 當基準。
+        gone = prune_old_releases(args.out, keep=max(1, args.keep_releases))
+        gone += [n + "\\" for n in prune_test_copies(keep=max(1, args.keep_releases))]
+        if gone:
+            print(f"\n已清掉 {len(gone)} 個舊版產物（各保留最近 "
+                  f"{max(1, args.keep_releases)} 版；不想清就加 --no-prune）：")
+            for name in gone:
+                print(f"    {name}")
 
     setup = ""
     if args.installer:

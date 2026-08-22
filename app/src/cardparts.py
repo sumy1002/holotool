@@ -756,6 +756,54 @@ def load_part_templates(parts_dir: str, bundled_dir: Optional[str] = None) -> di
     return out
 
 
+def select_effective_parts(parts_dir: str, bundled_dir: Optional[str] = None) -> list[str]:
+    """回傳「實際會被拿來比對」的樣板**檔名**清單（排序過）。
+
+    挑選規則跟 `load_part_templates()` 一對一：裁壞的小點濾掉；某個比較組
+    每個標籤自己抓的都湊滿 `MIN_OWN_TO_DROP_BUNDLED` 張時整組只用自己的，
+    否則自己的＋內建的混用。
+
+    給打包用（`build_exe._publish_parts_to_defaults`）：把主機上**實際生效**
+    的那一套原封搬進 `defaults/parts/`，其他電腦載入整包時得到的比對池就跟
+    主機一模一樣。不能直接把 card_templates/parts 整包搬 —— 那裡面可能還躺著
+    「已被自己的樣板整組取代」的內建糊圖，全搬等於把主機上已經淘汰的糊圖
+    重新混回其他電腦的比對池（糊掉的 7 搶走清楚的 2 那個老問題）。
+    """
+    if not os.path.isdir(parts_dir):
+        return []
+    fingerprints = bundled_fingerprints(bundled_dir)
+    own: dict = {"rank": {}, "suit": {}, "pip": {}}
+    fallback: dict = {"rank": {}, "suit": {}, "pip": {}}
+    for fname in sorted(os.listdir(parts_dir)):
+        parsed = parse_part_name(fname)
+        if parsed is None:
+            continue
+        kind, key = parsed
+        img = cv2.imread(os.path.join(parts_dir, fname), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            continue
+        size = PART_SIZES[kind]
+        if (img.shape[1], img.shape[0]) != size:
+            img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
+        cleaned = clean_part_mask((img > 127).astype(np.uint8) * 255, kind)
+        if not part_is_usable(cleaned):
+            continue
+        bucket = fallback if is_bundled_copy(parts_dir, fname, fingerprints) else own
+        bucket[kind].setdefault(key, []).append(fname)
+
+    out: list[str] = []
+    for kind in ("rank", "suit", "pip"):
+        keys = set(own[kind]) | set(fallback[kind])
+        for key in keys:
+            group = _group_for(kind, key)
+            enough = all(len(own[kind].get(k, [])) >= MIN_OWN_TO_DROP_BUNDLED
+                         for k in group)
+            mine = own[kind].get(key, [])
+            theirs = fallback[kind].get(key, [])
+            out.extend(mine if (enough and mine) else mine + theirs)
+    return sorted(out)
+
+
 def part_inventory(parts_dir: str, bundled_dir: Optional[str] = None) -> dict:
     """每個標籤的樣板統計，給 GUI 的「蒐集進度」用。
 
@@ -961,11 +1009,42 @@ def _align_variants(query: np.ndarray, radius: int = 1) -> list:
 
 
 def _score_bank(query, bank: dict, align: int = 1) -> dict:
+    """對一整個樣板庫比對，回傳 {標籤: 最高分}。
+
+    數學上等同「對每個 (位移變體, 樣板) 配對呼叫 part_score() 取最大值」，
+    但把重複的準備工作抽出來只算一次：舊寫法對每一個配對都各自重算
+    「float32 正規化」與「投影輪廓」，9 個變體 × 幾十張樣板一輪下來，
+    同一條輪廓被重算上百次 —— 而這正是每個 tick 讀牌的主要 CPU 開銷。
+
+    ⚠️ 重疊度是**灰階的軟性 IoU**（逐像素 min/max），不是二值的：
+    `_normalize` 用 INTER_AREA 縮放，查詢小圖裡有一堆中間灰階值，
+    直接二值化再算交集會得到不一樣的分數（差到 0.002 就足以翻轉領先幅度
+    的判定）。所以這裡預先算好的是 float32 正規化圖，逐配對仍然做
+    elementwise min/max —— 跟 `_shape_score` 一個位元都不差。
+    """
     variants = _align_variants(query, align)
-    return {
-        label: max(part_score(v, t) for t in imgs for v in variants)
-        for label, imgs in bank.items()
-    }
+    v_floats = [v.astype(np.float32) / 255.0 for v in variants]
+    v_profiles = [_profile(v) for v in variants]
+
+    out: dict = {}
+    for label, imgs in bank.items():
+        best = 0.0
+        for tmpl in imgs:
+            if tmpl is None or tmpl.shape != variants[0].shape:
+                # 尺寸對不上時 part_score 會回 0 分，照舊
+                continue
+            t_float = tmpl.astype(np.float32) / 255.0
+            t_profile = _profile(tmpl)
+            for v_float, v_profile in zip(v_floats, v_profiles):
+                inter = float(np.minimum(v_float, t_float).sum())
+                union = float(np.maximum(v_float, t_float).sum())
+                iou = (inter / union) if union > 0 else 0.0
+                profile = 1.0 - float(np.abs(v_profile - t_profile).mean())
+                score = 0.5 * iou + 0.5 * profile
+                if score > best:
+                    best = score
+        out[label] = best
+    return out
 
 
 def _best_match(query, bank: dict, min_score: float, min_margin: float, align: int = 1,

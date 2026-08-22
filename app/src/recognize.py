@@ -22,7 +22,7 @@ import cv2
 import numpy as np
 
 from . import cardparts
-from .paths import default_parts_dir, parts_dir, template_dir
+from .paths import default_parts_dir, is_master_install, parts_dir, template_dir
 
 TEMPLATE_DIR = template_dir()
 
@@ -76,12 +76,43 @@ def load_card_templates(template_dir: str = TEMPLATE_DIR) -> dict[str, list]:
     return templates
 
 
-def load_part_templates(directory: Optional[str] = None) -> dict:
-    """載入 card_templates/parts/ 裡的點數與花色樣板。
+def resolve_part_source(cfg: Optional[dict] = None) -> tuple[str, Optional[str], str]:
+    """點數/花色樣板要從哪裡載入。回傳 (樣板資料夾, 內建資料夾或 None, 模式)。
 
-    同時把 defaults/parts/ 一起傳進去，讓「已經有自己樣板的標籤」不再混進內建的糊圖。
+    卡牌樣板從 2026-08-22 起**隨程式發布**：打包時主機上實際生效的那一套會被
+    同步進 `defaults/parts/`，所以：
+
+    * **主機**（旁邊有原始碼專案，見 `paths.is_master_install`）→ "local"：
+      照舊用 `card_templates/parts/` 蒐集的（立即生效、繼續累積），
+      內建的當墊背 —— 這一套正是打包時要送出去的資料來源。
+    * **其他電腦**（zip / 安裝檔裝的）→ "bundled"：直接吃 `defaults/parts/`，
+      本機蒐集的不參與比對 —— 每次更新程式，辨識用的就是開發者那一套。
+      本機檔案**一個都不會被刪**，只是不用；想自己蒐集，把 config.json 的
+      `card_template_source` 設成 "local" 即可。
+
+    `cfg["card_template_source"]`： "auto"（預設，照上面自動判斷）／
+    "local"／"bundled"（強制指定）。
     """
-    return cardparts.load_part_templates(directory or parts_dir(), default_parts_dir())
+    mode = str((cfg or {}).get("card_template_source") or "auto").strip().lower()
+    if mode not in ("auto", "local", "bundled"):
+        mode = "auto"
+    if mode == "local" or (mode == "auto" and is_master_install()):
+        return parts_dir(), default_parts_dir(), "local"
+    return default_parts_dir(), None, "bundled"
+
+
+def load_part_templates(directory: Optional[str] = None,
+                        cfg: Optional[dict] = None) -> dict:
+    """載入點數與花色樣板。
+
+    有指定 `directory` 就照舊從那裡載入（離線工具、測試用），並把
+    defaults/parts/ 當內建墊背傳進去；沒有指定就依 `resolve_part_source`
+    決定來源 —— 主機吃本機蒐集的、其他電腦吃內建的（隨程式更新）。
+    """
+    if directory is not None:
+        return cardparts.load_part_templates(directory, default_parts_dir())
+    source, bundled, _mode = resolve_part_source(cfg)
+    return cardparts.load_part_templates(source, bundled)
 
 
 def part_sources(directory: Optional[str] = None) -> dict:
@@ -140,6 +171,46 @@ def _resize(tmpl: np.ndarray, scale: float) -> Optional[np.ndarray]:
 _SCALE_MULTIPLIERS = (0.68, 0.78, 0.86, 0.93, 1.0, 1.07, 1.15)
 
 
+# 樣板「灰階 + 各倍率縮放」的快取。
+#
+# 為什麼需要：主迴圈每個 tick 對七張標記各比對一次，而樣板從載入到程式結束
+# 都不會變 —— 舊寫法每個 tick 都把同一張樣板重新轉灰階、再各縮放 7 個倍率，
+# 每秒白做幾十次 cvtColor/resize。視窗大小不變時，這些結果完全可以重用。
+#
+# 快取鍵是 id(樣板)。id 有「物件被回收後重複使用」的風險，所以每一筆都存一份
+# 取樣指紋（shape + dtype + 幾行取樣位元組），命中時先核對指紋，對不上就重算。
+# 就算撞到「id 相同、指紋也相同」的天文機率事件，兩張圖的取樣內容一致，
+# 縮放結果也幾乎相同，錯不到哪裡去。
+_TMPL_CACHE: dict = {}
+_TMPL_CACHE_LIMIT = 64
+
+
+def _tmpl_fingerprint(tmpl: np.ndarray) -> tuple:
+    return (tmpl.shape, tmpl.dtype.str, tmpl[::7, ::13].tobytes())
+
+
+def _scaled_templates(template: np.ndarray, expected_scale: float,
+                      multipliers: tuple) -> tuple[np.ndarray, list]:
+    """回傳 (灰階原圖, [各倍率縮好的灰階樣板或 None])，結果會被快取。"""
+    key = id(template)
+    fp = _tmpl_fingerprint(template)
+    entry = _TMPL_CACHE.get(key)
+    if entry is None or entry["fp"] != fp:
+        if len(_TMPL_CACHE) >= _TMPL_CACHE_LIMIT:
+            _TMPL_CACHE.clear()
+        entry = {"fp": fp, "gray": _as_gray(template), "pyramids": {}}
+        _TMPL_CACHE[key] = entry
+    pkey = (round(float(expected_scale), 6), multipliers)
+    pyramid = entry["pyramids"].get(pkey)
+    if pyramid is None:
+        gray = entry["gray"]
+        pyramid = [_resize(gray, expected_scale * m) for m in multipliers]
+        if len(entry["pyramids"]) >= 8:      # 視窗被拉來拉去也別讓它無限長大
+            entry["pyramids"].clear()
+        entry["pyramids"][pkey] = pyramid
+    return entry["gray"], pyramid
+
+
 def marker_score(
     roi: np.ndarray,
     template: np.ndarray,
@@ -157,16 +228,18 @@ def marker_score(
     if roi is None or template is None or roi.size == 0 or template.size == 0:
         return 0.0
     img = _as_gray(roi)
-    tmpl0 = _as_gray(template)
     if img.shape[0] < 8 or img.shape[1] < 8:
         return 0.0
     if not math.isfinite(expected_scale) or expected_scale <= 0:
         expected_scale = 1.0
 
+    # 灰階與縮放結果從快取拿（樣板不會變、視窗大小也很少變，每個 tick 重算
+    # 同一批 cvtColor/resize 純粹是浪費 —— 見 _scaled_templates 的說明）。
+    tmpl0, pyramid = _scaled_templates(template, expected_scale, tuple(multipliers))
+
     best = 0.0
     tried = 0
-    for m in multipliers:
-        resized = _resize(tmpl0, expected_scale * m)
+    for resized in pyramid:
         if resized is None:
             continue
         if resized.shape[0] > img.shape[0] or resized.shape[1] > img.shape[1]:
